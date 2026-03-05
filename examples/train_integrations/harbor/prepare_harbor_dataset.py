@@ -89,11 +89,15 @@ def _extract_one(args: tuple) -> bool:
         return False
 
 
-def extract_parquet(parquet_path: Path, output_dir: Path) -> int:
+def extract_parquet(parquet_path: Path, output_dir: Path, limit: int | None = None) -> int:
     """Extract tasks from a parquet file with path + task_binary columns."""
     table = pq.read_table(parquet_path)
     path_col = table.column("path").to_pylist()
     data_col = table.column("task_binary").to_pylist()
+
+    if limit is not None:
+        path_col = path_col[:limit]
+        data_col = data_col[:limit]
 
     output_dir.mkdir(parents=True, exist_ok=True)
     args = [(p, d, str(output_dir)) for p, d in zip(path_col, data_col)]
@@ -104,7 +108,7 @@ def extract_parquet(parquet_path: Path, output_dir: Path) -> int:
     return sum(results)
 
 
-def prepare(dataset_name: str, output_dir: str | None = None) -> str:
+def prepare(dataset_name: str, output_dir: str | None = None, limit: int | None = None) -> str:
     from huggingface_hub import snapshot_download
 
     repo_name = dataset_name.split("/")[-1] if "/" in dataset_name else dataset_name
@@ -141,9 +145,14 @@ def prepare(dataset_name: str, output_dir: str | None = None) -> str:
         return str(output_path)
 
     total = 0
+    remaining = limit
     for pq_file in parquets:
         print(f"Extracting {pq_file.name}...")
-        total += extract_parquet(pq_file, output_path)
+        total += extract_parquet(pq_file, output_path, limit=remaining)
+        if remaining is not None:
+            remaining = remaining - total
+            if remaining <= 0:
+                break
 
     print(f"Done! {total} tasks extracted to {output_path}")
     return str(output_path)
@@ -153,5 +162,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare Harbor task dataset from HuggingFace Hub")
     parser.add_argument("--dataset", required=True, help="HuggingFace dataset (e.g. open-thoughts/CodeContests)")
     parser.add_argument("--output_dir", default=None, help="Output directory (default: ~/data/harbor/<repo-name>)")
+    parser.add_argument("--limit", type=int, default=None, help="Max number of tasks to extract (default: all)")
     args = parser.parse_args()
-    prepare(args.dataset, args.output_dir)
+    prepare(args.dataset, args.output_dir, args.limit)

@@ -82,7 +82,11 @@ volume = create_modal_volume()
     image=image,
     gpu=os.environ.get("MODAL_GPU", "L4:1"),
     volumes=volume,
-    timeout=3600,  # 1 hour
+    timeout=int(os.environ.get("MODAL_TIMEOUT", "14400")),  # default 4 hours, configurable via env
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("daytona-secret"),
+    ],
 )
 def run_script(command: str):
     """

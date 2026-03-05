@@ -14,14 +14,14 @@ set -ex
 # Prepare datasets first (downloads from HuggingFace and extracts tasks):
 # uv run examples/train_integrations/harbor/prepare_harbor_dataset.py --dataset open-thoughts/CodeContests
 # uv run examples/train_integrations/harbor/prepare_harbor_dataset.py --dataset open-thoughts/OpenThoughts-TB-dev
-DATA_DIR="$HOME/data/harbor"
+DATA_DIR="${SKYRL_DATA_DIR:-$HOME/data/harbor}"
 TRAIN_DATA="['$DATA_DIR/CodeContests']"
 EVAL_DATA="['$DATA_DIR/OpenThoughts-TB-dev']"
 
 #-----------------------
 # Directory setup
 #-----------------------
-RUN_NAME="codecontest"
+RUN_NAME="${SKYRL_RUN_NAME:-codecontest-$(date +%m%d-%H%M)}"
 TRIALS_DIR="$HOME/$RUN_NAME/trials_run"
 CKPTS_DIR="$HOME/$RUN_NAME/ckpts"
 EXPORTS_DIR="$HOME/$RUN_NAME/exports"
@@ -48,7 +48,7 @@ CHAT_TEMPLATE_PATH="$(dirname "$0")/../../../skyrl/train/utils/templates/qwen3_a
 NUM_GPUS=4
 ENABLE_RATE_LIMITING=true  # Enable rate/concurrency limiting for trajectory submissions
 TRAJECTORIES_PER_SECOND=5  # Maximum trajectories per second (must be >= 1.0, fractional values like 1.5 are supported). null or omit to disable rate limiting
-MAX_CONCURRENCY=512        # Maximum concurrent trial.run() calls allowed (must be >= 1). null or omit to disable concurrency limiting
+MAX_CONCURRENCY=90         # Maximum concurrent trial.run() calls allowed (must be >= 1). null or omit to disable concurrency limiting
 
 # Run SkyRL command
 uv run --isolated --extra fsdp --extra harbor -m examples.train_integrations.harbor.entrypoints.main_harbor \
@@ -88,10 +88,10 @@ uv run --isolated --extra fsdp --extra harbor -m examples.train_integrations.har
   trainer.hf_save_interval=5 \
   trainer.algorithm.max_seq_len=$MAX_MODEL_LEN \
   trainer.policy.optimizer_config.lr=1.0e-6 \
-  generator.n_samples_per_prompt=8 \
+  generator.n_samples_per_prompt=3 \
   generator.eval_n_samples_per_prompt=4 \
   generator.apply_overlong_filtering=$APPLY_OVERLONG_FILTERING \
-  generator.inference_engine.gpu_memory_utilization=0.8 \
+  generator.inference_engine.gpu_memory_utilization=0.5 \
   trainer.logger=wandb \
   trainer.project_name=harbor \
   trainer.run_name=$RUN_NAME \

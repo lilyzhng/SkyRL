@@ -38,6 +38,8 @@ class HarborAgentOutput:
     trajectory_id: TrajectoryID
     summarization_count: Optional[int] = None
     num_turns: Optional[int] = None
+    chat_history: Optional[List[dict]] = None
+    trial_dir: Optional[str] = None
 
 
 class HarborGenerator(GeneratorInterface):
@@ -126,6 +128,19 @@ class HarborGenerator(GeneratorInterface):
                     tg.create_task(_worker(idx, prompt, trajectory_id))
         finally:
             progress.close()
+        # Store trial info for WandB trajectory logging
+        self._last_eval_trials = [
+            {
+                "trajectory_id": str(o.trajectory_id),
+                "reward": o.reward,
+                "stop_reason": o.stop_reason,
+                "num_turns": o.num_turns,
+                "trial_dir": o.trial_dir,
+            }
+            for o in all_outputs
+            if o.chat_history is not None and o.trial_dir is not None
+        ]
+
         all_outputs, rollout_metrics = self._mask_failed_instances_and_compute_metrics(all_outputs)
 
         generator_output: GeneratorOutput = {
@@ -139,6 +154,61 @@ class HarborGenerator(GeneratorInterface):
         }
 
         return generator_output
+
+    def log_trajectories_to_wandb(self, step: int, max_trajectories: int = 10):
+        """Log eval trajectories as a WandB artifact in Harbor job format.
+
+        Uploads the actual trial directories (with ATIF trajectory.json, result.json, etc.)
+        so they can be downloaded and viewed directly with `harbor view`.
+        """
+        import json
+        from pathlib import Path
+
+        try:
+            import wandb
+            if wandb.run is None:
+                return
+        except ImportError:
+            return
+
+        trials = getattr(self, "_last_eval_trials", [])
+        if not trials:
+            return
+
+        sorted_trials = sorted(trials, key=lambda t: t["reward"], reverse=True)
+        selected = sorted_trials[:max_trajectories]
+
+        artifact = wandb.Artifact(
+            f"eval-trajectories-step{step}",
+            type="harbor-job",
+            metadata={"step": step, "n_trials": len(selected)},
+        )
+
+        n_added = 0
+        for t in selected:
+            trial_dir = Path(t["trial_dir"])
+            if not trial_dir.exists():
+                logger.warning(f"Trial dir not found, skipping: {trial_dir}")
+                continue
+
+            trial_name = trial_dir.name
+            # Add key files: trajectory.json, result.json, config.json
+            for filename in ["agent/trajectory.json", "result.json", "config.json"]:
+                filepath = trial_dir / filename
+                if filepath.exists():
+                    artifact.add_file(str(filepath), name=f"{trial_name}/{filename}")
+
+            # Also add any continuation trajectories
+            agent_dir = trial_dir / "agent"
+            if agent_dir.exists():
+                for cont_file in agent_dir.glob("trajectory.cont-*.json"):
+                    artifact.add_file(str(cont_file), name=f"{trial_name}/agent/{cont_file.name}")
+
+            n_added += 1
+
+        if n_added > 0:
+            wandb.log_artifact(artifact)
+            logger.info(f"Logged {n_added} trial trajectories as WandB artifact at step {step}")
 
     @staticmethod
     def _mask_failed_instances_and_compute_metrics(
@@ -346,4 +416,6 @@ class HarborGenerator(GeneratorInterface):
             trajectory_id=trajectory_id,
             summarization_count=summarization_count,
             num_turns=num_turns,
+            chat_history=chat_history,
+            trial_dir=str(trial.trial_dir),
         )

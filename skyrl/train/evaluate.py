@@ -87,6 +87,10 @@ async def evaluate(
         reward=generator_output["rewards"][0],
     )
 
+    # Log eval trajectories as chat-style HTML to WandB (if generator supports it)
+    if hasattr(generator, "log_trajectories_to_wandb"):
+        generator.log_trajectories_to_wandb(step=global_step or 0)
+
     # 2. Group data by data source and calculate per-dataset metrics
     eval_metrics = calculate_per_dataset_metrics(
         concat_generator_outputs, concat_uids, concat_data_sources, cfg.generator.eval_n_samples_per_prompt
