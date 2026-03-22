@@ -10,7 +10,7 @@
 
 set -ex
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 MODAL_GPU=H100:4 MODAL_TIMEOUT=14400 modal run --detach examples/train_integrations/modal/main.py \
   --command "\
@@ -38,4 +38,7 @@ MODAL_GPU=H100:4 MODAL_TIMEOUT=14400 modal run --detach examples/train_integrati
       data.val_data=\"['/root/data/harbor/CodeContests-eval']\" \
       trainer.eval_before_train=true \
       trainer.eval_interval=5 \
+      trainer.train_batch_size=10 \
+      trainer.policy_mini_batch_size=10 \
+      generator.inference_engine.gpu_memory_utilization=0.4 \
   "

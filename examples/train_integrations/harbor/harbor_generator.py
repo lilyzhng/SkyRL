@@ -138,7 +138,7 @@ class HarborGenerator(GeneratorInterface):
                 "trial_dir": o.trial_dir,
             }
             for o in all_outputs
-            if o.chat_history is not None and o.trial_dir is not None
+            if o is not None and o.chat_history is not None and o.trial_dir is not None
         ]
 
         all_outputs, rollout_metrics = self._mask_failed_instances_and_compute_metrics(all_outputs)
