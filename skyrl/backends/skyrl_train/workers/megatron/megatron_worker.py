@@ -1,4 +1,5 @@
 import os
+import shutil
 from collections import defaultdict
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
@@ -9,6 +10,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from huggingface_hub import snapshot_download
+from loguru import logger
 from megatron.bridge import AutoBridge
 from megatron.bridge.peft.canonical_lora import CanonicalLoRA
 from megatron.bridge.peft.lora import LoRA
@@ -17,12 +19,15 @@ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from omegaconf import OmegaConf
 from transformers import AutoConfig
 
-from skyrl.backends.skyrl_train.distributed.dispatch import MeshRank
+from skyrl.backends.skyrl_train.distributed.dispatch import MeshRank, WorkerOutput
 from skyrl.backends.skyrl_train.distributed.megatron.megatron_strategy import (
     MegatronStrategy,
 )
 from skyrl.backends.skyrl_train.distributed.megatron.megatron_utils import (
     broadcast_object_across_pp_ranks,
+    freeze_moe_router,
+    get_model_config,
+    get_moe_metrics,
     print_model_size,
 )
 from skyrl.backends.skyrl_train.distributed.megatron.optimizer import (
@@ -30,12 +35,23 @@ from skyrl.backends.skyrl_train.distributed.megatron.optimizer import (
     get_megatron_optimizer_param_scheduler,
     init_megatron_optim_config,
 )
+from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+    SKYRL_LORA_ADAPTER_NAME,
+)
 from skyrl.backends.skyrl_train.training_batch import (
     TrainingInputBatch,
-    TrainingOutputBatch,
 )
 from skyrl.backends.skyrl_train.utils.profiler import Profiler
-from skyrl.backends.skyrl_train.weight_sync import WeightChunk, WeightExtractor
+from skyrl.backends.skyrl_train.weight_sync import (
+    LoraLoadRequest,
+    WeightChunk,
+    WeightExtractor,
+)
+from skyrl.backends.skyrl_train.workers.megatron.adapter_store import (
+    AdapterStore,
+    LoraSignature,
+    iter_opts,
+)
 from skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper import (
     MegatronModelWrapper,
 )
@@ -60,68 +76,7 @@ if TYPE_CHECKING:
     )
     from skyrl.train.config.config import InferenceEngineConfig
 
-# ---------------------------------------------------------------------------
-# Register additional model bridges for architectures not yet in the upstream
-# Megatron-Bridge package. GLM-4.7-Flash uses the same architecture as
-# DeepSeek-V3 (MLA + MoE) so we reuse that bridge with a trivial subclass.
-# ---------------------------------------------------------------------------
-try:
-    from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
-    from megatron.bridge.models.deepseek.common import get_common_configs
-    from megatron.bridge.models.deepseek.deepseek_provider import (
-        DeepSeekV3ModelProvider,
-    )
-    from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge
-    from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
-    from megatron.core.models.gpt.gpt_model import GPTModel
-
-    @MegatronModelBridge.register_bridge(
-        source="Glm4MoeLiteForCausalLM",
-        target=GPTModel,
-    )
-    class _GLM47FlashBridge(DeepSeekV3Bridge):
-        """Bridge for GLM-4.7-Flash (Glm4MoeLiteForCausalLM).
-
-        GLM-4.7-Flash is architecturally identical to DeepSeek-V3 (MLA + MoE)
-        but its HF config differs in rope_scaling format:
-        - DeepSeek: rope_scaling has factor/mscale/mscale_all_dim, top-level rope_theta
-        - GLM-4.7-Flash: rope_scaling has rope_theta/rope_type, no mscale fields
-        """
-
-        def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> DeepSeekV3ModelProvider:
-            hf_config = hf_pretrained.config
-
-            # Temporarily normalize rope_scaling so get_common_configs works.
-            # GLM-4.7-Flash uses default rope (no scaling), so set factor=1.0.
-            orig_rope_scaling = hf_config.rope_scaling
-            orig_rope_theta = getattr(hf_config, "rope_theta", None)
-            rope_theta = orig_rope_scaling.get("rope_theta", 10000.0) if orig_rope_scaling else 10000.0
-            hf_config.rope_scaling = None  # triggers the else branch (defaults to 1.0)
-            hf_config.rope_theta = rope_theta
-
-            try:
-                configs = get_common_configs(hf_pretrained)
-            finally:
-                hf_config.rope_scaling = orig_rope_scaling
-                if orig_rope_theta is None:
-                    delattr(hf_config, "rope_theta")
-                else:
-                    hf_config.rope_theta = orig_rope_theta
-
-            configs["fp16"] = self.dtype_from_hf(hf_config, default=torch.float32) == torch.float16
-            configs["bf16"] = self.dtype_from_hf(hf_config, default=torch.float32) == torch.bfloat16
-            configs["params_dtype"] = self.dtype_from_hf(hf_config, default=torch.float32)
-
-            configs["make_vocab_size_divisible_by"] = 1280
-            configs["moe_router_score_function"] = "sigmoid"
-            configs["moe_router_enable_expert_bias"] = True
-            if hasattr(hf_config, "aux_loss_alpha"):
-                configs["moe_aux_loss_coeff"] = hf_config.aux_loss_alpha
-
-            return DeepSeekV3ModelProvider(**configs)
-
-except ImportError:
-    pass  # megatron-bridge not installed (e.g. CPU-only environment)
+import skyrl.backends.skyrl_train.workers.megatron.model_bridges as _  # noqa: F401  # register extra bridges
 
 
 class MegatronWeightExtractor(WeightExtractor):
@@ -167,6 +122,14 @@ class MegatronWeightExtractor(WeightExtractor):
         every ``extract_weights`` call so that mapping objects start with clean
         PP-collective caches, avoiding stale cached state across offload/reload
         and training cycles.
+
+        Tasks that participate in grouped export (e.g., fused MoE expert
+        weights) are collected first and placed into dedicated buckets so that
+        all tasks sharing the same ``group_key`` end up in a single
+        ``export_hf_weights`` call.  The bridge's
+        ``_accumulate_grouped_export`` requires every task for a group to be
+        present in one call; splitting them across buckets causes expert
+        weights to never be yielded.
         """
         weight_conversion_tasks = self.bridge.get_conversion_tasks(self.actor_module)
 
@@ -191,14 +154,46 @@ class MegatronWeightExtractor(WeightExtractor):
             for task in weight_conversion_tasks
         ]
 
-        self.bucket_index_groups: list[list[int]] = [[]]
+        # ---- Separate grouped-export tasks from regular tasks ----
+        # Grouped-export tasks (is_grouped_export=True, e.g. FusedGatedExpertMapping /
+        # FusedExpertMapping for MoE expert weights) must ALL be present in a single
+        # export_hf_weights call for the bridge's _accumulate_grouped_export to produce
+        # the fused tensor.  Collect them by group_key and give each group its own bucket.
+        grouped_task_indices: dict[str, list[int]] = {}  # group_key -> list of task indices
+        regular_task_indices: list[int] = []
+
+        for idx, task in enumerate(weight_conversion_tasks):
+            if getattr(task.mapping, "is_grouped_export", False):
+                gk = getattr(task.mapping, "group_key", None)
+                grouped_task_indices.setdefault(gk, []).append(idx)
+            else:
+                regular_task_indices.append(idx)
+
+        self.bucket_index_groups: list[list[int]] = []
+
+        # Pack grouped-export tasks into buckets by size, keeping each
+        # group_key's tasks together (they must not be split across calls).
         curr_size = 0
-        for idx, size in enumerate(sizes):
-            if curr_size + size > self.bucket_size_threshold_GB * 1024**3:
+        threshold = self.bucket_size_threshold_GB * 1024**3
+        for gk, indices in grouped_task_indices.items():
+            group_size = sum(sizes[idx] for idx in indices if sizes[idx] is not None)
+            if not self.bucket_index_groups or curr_size + group_size > threshold:
                 self.bucket_index_groups.append([])
                 curr_size = 0
-            self.bucket_index_groups[-1].append(idx)
-            curr_size += size
+            self.bucket_index_groups[-1].extend(indices)
+            curr_size += group_size
+
+        # Bucket regular (non-grouped) tasks by size as before.
+        if regular_task_indices:
+            self.bucket_index_groups.append([])
+            curr_size = 0
+            for idx in regular_task_indices:
+                size = sizes[idx]
+                if curr_size + size > threshold:
+                    self.bucket_index_groups.append([])
+                    curr_size = 0
+                self.bucket_index_groups[-1].append(idx)
+                curr_size += size
 
     def get_weight_metadata(self, dtype: torch.dtype) -> dict:
         """Return weight metadata without keeping tensors in memory.
@@ -210,21 +205,39 @@ class MegatronWeightExtractor(WeightExtractor):
         if hasattr(self, "_weight_metadata_cache"):
             return self._weight_metadata_cache
 
+        self._ensure_buckets_initialized()
         names = []
         dtype_names = []
         shapes = []
         dtype_name = str(dtype).split(".")[-1]
-        device = torch.cuda.current_device()
-        for name, tensor in self.bridge.export_hf_weights(
-            self.actor_module,
-            show_progress=False,
-            conversion_tasks=None,
-        ):
-            tensor = tensor.to(device=device, dtype=dtype, non_blocking=True)
-            names.append(name)
-            dtype_names.append(dtype_name)
-            shapes.append(list(tensor.shape))
-            del tensor
+        # Collect parameter metadata in the same order
+        # as provided by `.extract_weights`.
+        if not self.enable_bucketing:
+            for name, tensor in self.bridge.export_hf_weights(
+                self.actor_module,
+                show_progress=False,
+                conversion_tasks=None,
+            ):
+                names.append(name)
+                dtype_names.append(dtype_name)
+                shapes.append(list(tensor.shape))
+                del tensor
+        else:
+            # Build fresh tasks each sync so mapping objects have clean
+            # PP-collective caches; reuse the pre-computed bucket structure.
+            fresh_tasks = self.bridge.get_conversion_tasks(self.actor_module)
+            for index_group in self.bucket_index_groups:
+                bucket_tasks = [fresh_tasks[i] for i in index_group]
+                for name, tensor in self.bridge.export_hf_weights(
+                    self.actor_module,
+                    show_progress=False,
+                    conversion_tasks=bucket_tasks,
+                ):
+                    names.append(name)
+                    shapes.append(list(tensor.shape))
+                    dtype_names.append(dtype_name)
+                    del tensor
+
         self._weight_metadata_cache = {"names": names, "dtype_names": dtype_names, "shapes": shapes}
         return self._weight_metadata_cache
 
@@ -340,6 +353,23 @@ class MegatronWorker:
 
         bridge = AutoBridge.from_hf_pretrained(model_path, trust_remote_code=True)
         provider = bridge.to_megatron_provider()
+
+        # Workaround for megatron-bridge CONFIG_MAPPING dropping None values:
+        # MLA models like Moonlight-16B have q_lora_rank=None (no Q compression),
+        # but CONFIG_MAPPING skips None so the MCoreMLATransformerConfig default
+        # (512) is used instead, causing the wrong model architecture to be built.
+        # see: https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/c8eb587c5fd43163dbcd9c40980225b3fe1981f8/src/megatron/bridge/recipes/moonlight/moonlight_16b.py#L60
+        if hasattr(provider, "q_lora_rank") and hasattr(hf_config, "q_lora_rank"):
+            provider.q_lora_rank = hf_config.q_lora_rank
+
+        # Workaround for transformers v5 moving rope_theta into rope_parameters
+        # (previously it was a top-level config attribute). megatron-bridge's
+        # CONFIG_MAPPING reads config.rope_theta which no longer exists in v5,
+        # causing it to fall back to the default rotary_base of 10000.
+        rope_params = getattr(hf_config, "rope_parameters", None) or getattr(hf_config, "rope_scaling", None)
+        if isinstance(rope_params, dict) and "rope_theta" in rope_params:
+            provider.rotary_base = rope_params["rope_theta"]
+
         provider.tensor_model_parallel_size = megatron_config.tensor_model_parallel_size
         provider.pipeline_model_parallel_size = megatron_config.pipeline_model_parallel_size
         provider.pipeline_dtype = torch.bfloat16 if bf16 else torch.float32
@@ -355,6 +385,8 @@ class MegatronWorker:
         # overridden by transformer_config_kwargs if needed.
         provider.moe_token_dispatcher_type = megatron_config.moe_token_dispatcher_type
         provider.moe_router_load_balancing_type = megatron_config.moe_router_load_balancing_type
+        provider.moe_aux_loss_coeff = megatron_config.moe_aux_loss_coeff
+        provider.moe_router_dtype = megatron_config.moe_router_dtype
         provider.moe_grouped_gemm = megatron_config.moe_grouped_gemm
         if megatron_config.moe_router_score_function is not None:
             provider.moe_router_score_function = megatron_config.moe_router_score_function
@@ -450,55 +482,6 @@ class MegatronWorker:
         )
         return model
 
-    def forward(self, data: TrainingInputBatch):
-        """
-        Override `Worker.forward` to support passing the full mini batch to the MegatronModelWrapper.forward method.
-        """
-        from skyrl.backends.skyrl_train.utils.replay_utils import clear_router_replay
-
-        # Run in micro batches grouped into a single mini-batch
-        micro_bsz = self.cfg.micro_forward_batch_size_per_gpu
-        micro_batches = data.chunk(micro_bsz)
-
-        # Build micro-batch dicts expected by policy.forward_mini_batch
-        micro_dicts = []
-        device = torch.cuda.current_device()
-        for micro in micro_batches:
-            micro.to(device)
-            sequences = micro["sequences"]
-            attention_mask = micro["attention_mask"]
-            num_actions = micro.metadata["response_length"]
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 0)
-            micro_dicts.append(
-                {
-                    "sequences": sequences,
-                    "attention_mask": attention_mask,
-                    "position_ids": position_ids,
-                    "num_actions": num_actions,
-                    "rollout_expert_indices": (
-                        micro.get("rollout_expert_indices") if self.enable_router_replay else None
-                    ),
-                }
-            )
-
-        self.model.eval()
-        seq_len = micro_dicts[0]["sequences"].shape[1]
-        mbs = micro_dicts[0]["sequences"].shape[0]
-        with torch.no_grad():
-            log_probs = self.model.forward(
-                micro_batches=micro_dicts,
-                seq_len=seq_len,
-                micro_batch_size=mbs,
-                temperature=self.cfg.algorithm.temperature,
-            )
-
-        log_probs = log_probs.to("cpu")
-        output = TrainingOutputBatch({"output": log_probs})
-        output.metadata = data.metadata
-        clear_router_replay()
-        return output
-
     def save_hf_model(self, export_dir: str, tokenizer):
         # Save model in HuggingFace safetensors format
         self.strategy.save_hf_model(
@@ -507,6 +490,10 @@ class MegatronWorker:
             export_dir,
             tokenizer=tokenizer,
         )
+
+    def _get_module_for_offload(self):
+        # The underlying offloadable module is `self.actor_module` instead of `self.model`.
+        return self.actor_module
 
 
 class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
@@ -518,26 +505,23 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         self.optimizer: DistributedOptimizer = None
         self.profiler: Profiler = None
         self._is_lora = self.cfg.policy.model.lora.rank > 0
-
-    def offload_to_cpu(self, pin_memory=True, non_blocking=True, offload_optimizer=True, offload_model=True):
-        self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
-        self.strategy.offload_to_cpu(
-            self.actor_module, self.optimizer, pin_memory, non_blocking, offload_optimizer, offload_model
-        )
-
-    def backload_to_gpu(self, non_blocking=True, backload_optimizer=True, backload_model=True):
-        self.strategy.backload_to_gpu(
-            self.actor_module, self.optimizer, non_blocking, backload_optimizer, backload_model
-        )
+        # Per-worker store of LoRA adapter snapshots. Allocated only for the
+        # LoRA path; FFT runs single-tenant exactly as before.
+        self.adapter_store: Optional[AdapterStore] = AdapterStore() if self._is_lora else None
 
     def init_worker_process_group(self):
         """
         Override DistributedTorchRayActor.init_worker_process_group to use megatron distributed setup to create the mesh.
         """
         if not torch.distributed.is_initialized():
+            # Ensure CUDA device is set before process group init — required when
+            # using split "cpu:gloo,cuda:nccl" backend to avoid 'invalid device ordinal'
+            # errors during NCCL communicator creation in subgroups.
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            torch.cuda.set_device(local_rank)
             # Default torch dist pg init timeout is 10 minutes (600 seconds)
             torch.distributed.init_process_group(
-                backend="nccl", timeout=timedelta(seconds=SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
+                backend="cpu:gloo,cuda:nccl", timeout=timedelta(seconds=SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
             )
 
         # Explicitly wrap torch.distributed.broadcast in torch.no_grad() to avoid a warning in Megatron training where the
@@ -559,6 +543,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             optimizer_config=self.cfg.policy.optimizer_config,
             seed=self.cfg.seed,
             is_lora=self._is_lora,
+            node_local_rank=self._local_rank,
         )
         self.strategy.setup_distributed()
 
@@ -593,6 +578,13 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
             patch_topk_router_layer_number()
 
+        # Freeze MoE router params before optimizer build.
+        # Megatron's DistributedOptimizer reads requires_grad at construction.
+        if self.cfg.policy.megatron_config.freeze_moe_router:
+            if self._rank == 0:
+                logger.info("freeze_moe_router=True: freezing MoE router params")
+            self.provider.register_pre_wrap_hook(freeze_moe_router)
+
         # wrap with DDP for training
         self.actor_module = self.make_megatron_module(
             wrap_with_ddp=True,
@@ -615,18 +607,24 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         if self.cfg.policy.megatron_config.torch_profiler_config.enable:
             self.profiler = Profiler(self.cfg.policy.megatron_config.torch_profiler_config)
 
-        # create optimizer
-        optim_config = init_megatron_optim_config(
-            self.cfg.policy.optimizer_config, self.cfg.policy.megatron_config.optimizer_config_kwargs
-        )
-        self.optimizer = get_megatron_optimizer(self.actor_module, optim_config)
+        # create optimizer (skipped for inference-only flows; Megatron's
+        # DistributedOptimizer eagerly materializes fp32 master + AdamW state
+        # on GPU, which OOMs large MoE models on memory-constrained nodes)
+        if self.cfg.policy.inference_only_init:
+            self.optimizer = None
+            self.scheduler = None
+        else:
+            optim_config = init_megatron_optim_config(
+                self.cfg.policy.optimizer_config, self.cfg.policy.megatron_config.optimizer_config_kwargs
+            )
+            self.optimizer = get_megatron_optimizer(self.actor_module, optim_config)
 
-        # create scheduler
-        self.scheduler = get_megatron_optimizer_param_scheduler(
-            optimizer=self.optimizer,
-            config=self.cfg.policy.optimizer_config,
-            num_training_steps=num_training_steps,
-        )
+            # create scheduler
+            self.scheduler = get_megatron_optimizer_param_scheduler(
+                optimizer=self.optimizer,
+                config=self.cfg.policy.optimizer_config,
+                num_training_steps=num_training_steps,
+            )
 
         # create worker model
         self.model = MegatronModelWrapper(
@@ -638,12 +636,155 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         self.empty_cuda_cache = self.cfg.policy.megatron_config.empty_cuda_cache
 
+    def forward(
+        self,
+        data: TrainingInputBatch,
+        loss_fn: Optional[str] = None,
+        loss_fn_config: Optional[Dict[str, Any]] = None,
+    ) -> WorkerOutput:
+        """Forward pass.
+
+        - Without ``loss_fn``: runs Megatron's pipeline inference and returns a
+          :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` (``logprobs``
+          key) and empty ``metrics``.
+        - With ``loss_fn`` (e.g., ``"cross_entropy"``): runs the SFT loss through Megatron's
+          pipeline schedule with ``forward_only=True`` (no backward) and returns a
+          :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` plus scalar
+          ``metrics`` (including ``"loss"``).
+        """
+        from skyrl.backends.skyrl_train.utils.replay_utils import clear_router_replay
+
+        if loss_fn is None:
+            # Megatron inference forward path: pass the full mini batch through
+            # MegatronModelWrapper.forward and emit per-sample logprobs.
+            micro_bsz = self.cfg.micro_forward_batch_size_per_gpu
+            micro_batches = data.chunk(micro_bsz)
+
+            # Build micro-batch dicts expected by policy.forward_mini_batch
+            micro_dicts = []
+            device = torch.cuda.current_device()
+            for micro in micro_batches:
+                micro.to(device)
+                sequences = micro["sequences"]
+                attention_mask = micro["attention_mask"]
+                num_actions = micro.metadata["response_length"]
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 0)
+                rollout_expert_indices = micro.get("rollout_expert_indices")
+                if rollout_expert_indices is not None:
+                    rollout_expert_indices = rollout_expert_indices.to(torch.int32)
+                micro_dicts.append(
+                    {
+                        "sequences": sequences,
+                        "attention_mask": attention_mask,
+                        "position_ids": position_ids,
+                        "num_actions": num_actions,
+                        "rollout_expert_indices": (rollout_expert_indices if self.enable_router_replay else None),
+                        "sub_seq_lengths": micro.get("sub_seq_lengths"),
+                    }
+                )
+
+            self.model.eval()
+            seq_len = micro_dicts[0]["sequences"].shape[1]
+            mbs = micro_dicts[0]["sequences"].shape[0]
+            with torch.no_grad():
+                log_probs = self.model.forward(
+                    micro_batches=micro_dicts,
+                    seq_len=seq_len,
+                    micro_batch_size=mbs,
+                    temperature=self.cfg.algorithm.temperature,
+                )
+
+            log_probs = log_probs.to("cpu")
+            clear_router_replay()
+            loss_fn_outputs = [{"logprobs": log_probs[i].tolist()} for i in range(log_probs.shape[0])]
+            return WorkerOutput(loss_fn_outputs=loss_fn_outputs, metrics={})
+
+        self.model.eval()
+
+        micro_batch_size = self.cfg.micro_forward_batch_size_per_gpu
+        all_metrics = defaultdict(list)
+        all_loss_fn_outputs: List[Dict[str, Any]] = []
+
+        # Move data to GPU
+        data.to(torch.cuda.current_device())
+
+        # Build micro-batch dicts expected by forward_backward_mini_batch
+        micro_buffer = []
+        for experience in BatchIterator(data, micro_batch_size, drop_last=False):
+            sequences = experience.sequences
+            attention_mask = experience.attention_mask
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 0)
+            rollout_expert_indices = experience.rollout_expert_indices
+            if rollout_expert_indices is not None:
+                rollout_expert_indices = rollout_expert_indices.to(torch.int32)
+
+            micro_buffer.append(
+                {
+                    "sequences": sequences,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "num_actions": experience.num_actions,
+                    "old_action_log_probs": experience.action_log_probs,
+                    "base_action_log_probs": experience.base_action_log_probs,
+                    "advantages": experience.advantages,
+                    "loss_mask": experience.loss_mask,
+                    "rollout_action_logprobs": experience.rollout_logprobs,
+                    "action_mask": experience.action_mask,
+                    "rollout_expert_indices": rollout_expert_indices if self.enable_router_replay else None,
+                    "sub_seq_lengths": experience.sub_seq_lengths,
+                }
+            )
+
+        for m_batch in micro_buffer:
+            m_batch["num_microbatches"] = len(micro_buffer)
+
+        if not micro_buffer:
+            return WorkerOutput()
+
+        seq_len = micro_buffer[0]["sequences"].shape[1]
+        micro_bsz = micro_buffer[0]["sequences"].shape[0]
+
+        with torch.no_grad():
+            metrics_list = self.model.forward_backward_mini_batch(
+                micro_batches=micro_buffer,
+                seq_len=seq_len,
+                micro_batch_size=micro_bsz,
+                temperature=self.cfg.algorithm.temperature,
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+                forward_only=True,
+            )
+
+        if self.empty_cuda_cache:
+            torch.cuda.empty_cache()
+
+        # Aggregate metrics across micro-batches
+        for metrics in metrics_list:
+            if metrics is None:
+                continue
+            if "loss_fn_outputs" in metrics:
+                all_loss_fn_outputs.extend(metrics.pop("loss_fn_outputs"))
+            for k, v in metrics.items():
+                all_metrics[k].append(v)
+
+        resolved_loss_name = loss_fn or self.cfg.algorithm.policy_loss_type
+        sum_loss_metrics = resolved_loss_name != "cross_entropy"
+
+        status = reduce_metrics(all_metrics, sum_loss_metrics=sum_loss_metrics)
+        group = mpu.get_data_parallel_group(with_context_parallel=False)
+        status = all_reduce_metrics(status, self.strategy, group=group, sum_loss_metrics=sum_loss_metrics)
+
+        clear_router_replay()
+        return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=status)
+
     def forward_backward(
         self,
         data: TrainingInputBatch,
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, float]:
+    ) -> WorkerOutput:
         """
         Perform forward and backward passes for a batch, handling micro-batching internally.
 
@@ -657,7 +798,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             loss_fn_config: Optional config overrides for the loss function.
 
         Returns:
-            Aggregated metrics dict across all micro batches
+            :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` and scalar
+            ``metrics`` (all-reduced across DP).
         """
         from skyrl.backends.skyrl_train.utils.replay_utils import clear_router_replay
 
@@ -672,13 +814,16 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # Move data to GPU
         data.to(torch.cuda.current_device())
 
-        # Build micro-batch dicts expected by forward_backward_mini_batch
+        # Build micro-batch dicts expected by forward_backward_mini_batch.
         micro_buffer = []
         for experience in BatchIterator(data, micro_batch_size, drop_last=False):
             sequences = experience.sequences
             attention_mask = experience.attention_mask
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 0)
+            rollout_expert_indices = experience.rollout_expert_indices
+            if rollout_expert_indices is not None:
+                rollout_expert_indices = rollout_expert_indices.to(torch.int32)
 
             micro_buffer.append(
                 {
@@ -692,15 +837,35 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                     "loss_mask": experience.loss_mask,
                     "rollout_action_logprobs": experience.rollout_logprobs,
                     "action_mask": experience.action_mask,
-                    "rollout_expert_indices": experience.rollout_expert_indices if self.enable_router_replay else None,
+                    "rollout_expert_indices": rollout_expert_indices if self.enable_router_replay else None,
+                    # used with global sequence packing
+                    "sub_seq_lengths": experience.sub_seq_lengths,
                 }
             )
 
+        for m_batch in micro_buffer:
+            m_batch["num_microbatches"] = len(micro_buffer)
+
         if not micro_buffer:
-            return {}
+            return WorkerOutput()
 
         seq_len = micro_buffer[0]["sequences"].shape[1]
         micro_bsz = micro_buffer[0]["sequences"].shape[0]
+
+        # Gate on first PP/TP/CP rank so we emit exactly one line per DP rank
+        # (matches how status all-reduce treats metrics as identical within a DP group).
+        if (
+            mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.get_pipeline_model_parallel_rank() == 0
+            and mpu.get_context_parallel_rank() == 0
+        ):
+            real_tokens = int(sum(int(mb["attention_mask"].sum().item()) for mb in micro_buffer))
+            num_microbatches = len(micro_buffer)
+            dp_rank = mpu.get_data_parallel_rank()
+            logger.info(
+                f"sequence packing | dp_rank={dp_rank} microbatches_this_step={num_microbatches} "
+                f"seq_len={seq_len} tokens={real_tokens}"
+            )
 
         metrics_list = self.model.forward_backward_mini_batch(
             micro_batches=micro_buffer,
@@ -714,9 +879,6 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         if self.empty_cuda_cache:
             torch.cuda.empty_cache()
 
-        # Track number of micro-batches for metrics
-        self._micro_batches_accumulated += len(micro_buffer)
-
         # Aggregate metrics across micro-batches
         all_loss_fn_outputs = []  # Handle separately from scalar metrics
         for metrics in metrics_list:
@@ -726,18 +888,40 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             for k, v in metrics.items():
                 all_metrics[k].append(v)
 
-        # Reduce and all-reduce metrics
-        status = reduce_metrics(dict(all_metrics))
-        status["policy_lr"] = self.optimizer.param_groups[0]["lr"]
-        status = all_reduce_metrics(status, self.strategy)
+        # TODO: SFT path still averages metrics across microbatches and workers.
+        # This needs to be unified with the RL path which sums.
+        resolved_loss_name = loss_fn or self.cfg.algorithm.policy_loss_type
+        sum_loss_metrics = resolved_loss_name != "cross_entropy"
 
-        # Add loss_fn_outputs back (not reduced, kept as list)
-        if all_loss_fn_outputs:
-            status["loss_fn_outputs"] = all_loss_fn_outputs
+        # Reduce across microbatches and all-reduce metrics across DP ranks
+        # (metrics should be identical within DP groups, i.e., across TP/PP/SP ranks)
+        # NOTE: Sum loss metrics because scaling is already applied at the advantage level
+        status = reduce_metrics(all_metrics, sum_loss_metrics=sum_loss_metrics)
+        if self.optimizer is not None:
+            status["policy_lr"] = self.optimizer.param_groups[0]["lr"]
+        group = mpu.get_data_parallel_group(with_context_parallel=False)
+        status = all_reduce_metrics(status, self.strategy, group=group, sum_loss_metrics=sum_loss_metrics)
+
+        # Collect MoE aux metrics averaged across microbatches (all-reduced across ranks
+        # inside get_moe_metrics) aggregating after per-microbatch scalar metrics.
+        total_num_microbatches = len(micro_buffer)
+        model_config = get_model_config(self.actor_module[0])
+        num_moe_experts = getattr(model_config, "num_moe_experts", None)
+        moe_metrics: Dict[str, Any] = {}
+        if num_moe_experts is not None and num_moe_experts > 1:
+            moe_loss_scale = 1.0 / max(1, total_num_microbatches)
+            moe_metrics = get_moe_metrics(
+                loss_scale=moe_loss_scale,
+                per_layer_logging=self.cfg.policy.megatron_config.moe_per_layer_logging,
+            )
+            # moe_metrics will only be non-empty if "moe_router_load_balancing_type" is set to "aux_loss", "seq_aux_loss", or "global_aux_loss"
+            if moe_metrics:
+                for k, v in moe_metrics.items():
+                    status[k] = v
 
         clear_router_replay()
 
-        return status
+        return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=status)
 
     def optim_step(self) -> Optional[float]:
         """
@@ -749,6 +933,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         Returns:
             The gradient norm (before scaling, after clipping), or None if unavailable.
         """
+        if self.optimizer is None:
+            raise RuntimeError("optim_step called but policy.inference_only_init=True (no optimizer constructed)")
         grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
 
         # Reset counter for next accumulation cycle
@@ -758,12 +944,15 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             grad_norm = grad_norm.detach().cpu().item() if hasattr(grad_norm, "item") else grad_norm
         return grad_norm
 
-    def get_lr(self) -> float:
+    def get_lr(self) -> Optional[float]:
         """
         Get current learning rate from optimizer.
 
-        Handles both regular optimizers and ChainedOptimizer.
+        Handles both regular optimizers and ChainedOptimizer. Returns None when
+        the worker was initialized with ``policy.inference_only_init=True``.
         """
+        if self.optimizer is None:
+            return None
         if isinstance(self.optimizer, ChainedOptimizer):
             return self.optimizer.chained_optimizers[0].param_groups[0]["lr"]
         return self.optimizer.param_groups[0]["lr"]
@@ -778,8 +967,10 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         Note: This bypasses the scheduler. The next scheduler.step() call
         will override this value unless the scheduler is configured for
-        constant LR.
+        constant LR. No-op when ``policy.inference_only_init=True``.
         """
+        if self.optimizer is None:
+            return
         if isinstance(self.optimizer, ChainedOptimizer):
             # ChainedOptimizer wraps multiple optimizers (e.g., for different param groups)
             for opt in self.optimizer.chained_optimizers:
@@ -802,8 +993,63 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             training_dtype=torch.bfloat16 if self.cfg.bf16 else torch.float32,
         )
 
+    async def _save_lora_adapters_and_sync(
+        self, lora_sync_path, inference_engine_client, lora_name: str = SKYRL_LORA_ADAPTER_NAME
+    ):
+        """Export LoRA adapter weights via Megatron-Bridge and tell the inference engine to load them.
+
+        All ranks participate in the collective export (TP/PP/EP gathering is
+        handled internally by the bridge).  Only rank 0 writes to disk and
+        sends the ``LoraLoadRequest``.
+        """
+        import json
+
+        from megatron.bridge.models.conversion.peft_bridge import (
+            build_adapter_config_dict,
+            infer_target_modules_from_adapter_weights,
+        )
+        from safetensors.torch import save_file
+
+        adapter_state = {}
+        for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=True, show_progress=False):
+            adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
+
+        if torch.distributed.get_rank() == 0:
+            os.makedirs(lora_sync_path, exist_ok=True)
+
+            target_modules = infer_target_modules_from_adapter_weights(adapter_state.keys())
+            base_model_name_or_path = str(
+                getattr(self.bridge.hf_pretrained, "model_name_or_path", "")
+                or getattr(self.bridge.hf_pretrained, "name_or_path", "")
+            )
+            adapter_config = build_adapter_config_dict(
+                self.lora_cls,
+                target_modules=target_modules,
+                base_model_name_or_path=base_model_name_or_path,
+            )
+
+            save_file(adapter_state, os.path.join(lora_sync_path, "adapter_model.safetensors"))
+            with open(os.path.join(lora_sync_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+                json.dump(adapter_config, f, ensure_ascii=False, indent=4)
+
+            # Send LoRA disk loading request to inference engine.
+            from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+                RemoteInferenceClient,
+            )
+
+            if isinstance(inference_engine_client, RemoteInferenceClient):
+                await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
+            else:
+                lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
+                await inference_engine_client.update_named_weights(lora_request)
+
+        torch.distributed.barrier()
+
     async def broadcast_to_inference_engines(
-        self, inference_engine_client: "InferenceEngineInterface", inference_engine_cfg: "InferenceEngineConfig"
+        self,
+        inference_engine_client: "InferenceEngineInterface",
+        inference_engine_cfg: "InferenceEngineConfig",
+        model_id: Optional[str] = None,
     ):
         use_prefix_cache = inference_engine_cfg.enable_prefix_caching
         generator_dtype = str_to_torch_dtype(inference_engine_cfg.model_dtype)
@@ -814,25 +1060,111 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         torch.cuda.empty_cache()
 
-        # Extract and send weights using the sender created at init time
-        weight_metadata = self.weight_extractor.get_weight_metadata(generator_dtype)
-        await self._weight_transfer_sender.send_chunks(
-            self.weight_extractor.extract_weights(generator_dtype),
-            weight_metadata=weight_metadata,
-        )
+        if self._is_lora and not self.cfg.policy.megatron_config.lora_config.merge_lora:
+            # AdapterStore.swap_to has already made `model_id` the live adapter
+            # before we get here; sync that adapter to vLLM under its own name
+            # so sample(model=<model_id>) routes correctly. Single-tenant
+            # (model_id=None) keeps the legacy shared path + name.
+            lora_name, lora_sync_path = self._resolve_lora_sync_target(model_id)
+            await self._save_lora_adapters_and_sync(lora_sync_path, inference_engine_client, lora_name=lora_name)
+        else:
+            # Extract and send weights using the sender created at init time
+            weight_metadata = self.weight_extractor.get_weight_metadata(generator_dtype)
+            await self._weight_transfer_sender.send_chunks(
+                self.weight_extractor.extract_weights(generator_dtype),
+                weight_metadata=weight_metadata,
+            )
 
         if cache_reset_task is not None:
             await cache_reset_task
         torch.cuda.empty_cache()
         torch.distributed.barrier()
 
-    def get_weight_statistics(self):
-        """Compute lightweight statistics for model weights"""
-        raise NotImplementedError()
-
     def _set_pad_token_id(self, pad_token_id):
         # this already gets set in the init_model method
         pass
+
+    # ------------------------------------------------------------------
+    # Multi-LoRA / AdapterStore Ray-callable methods
+    # ------------------------------------------------------------------
+
+    def prime_optimizer_state(self) -> None:
+        """Materialise DistributedOptimizer state (exp_avg / exp_avg_sq).
+
+        Adam's state tensors are allocated lazily on the first non-trivial
+        step; without priming, the pristine snapshot would miss them.
+        Megatron exposes ``_init_optimizer_states_with_dummy_values()`` which
+        zero-fills grads + steps once + zero_grads, leaving the model weights
+        unchanged.
+        """
+        if not self._is_lora:
+            raise RuntimeError("prime_optimizer_state is only used on the LoRA path")
+        for _opt in iter_opts(self.optimizer):
+            init_fn = getattr(_opt, "_init_optimizer_states_with_dummy_values", None)
+            if init_fn is not None:
+                init_fn()
+
+    def register_pristine_adapter(self) -> None:
+        """Capture the current (freshly-initialised) LoRA state as the
+        pristine slot. Must be called once per worker, after
+        prime_optimizer_state.
+        """
+        if self.adapter_store is None:
+            raise RuntimeError("AdapterStore not initialised (FFT path)")
+        signature = LoraSignature.from_lora_config(
+            self.cfg.policy.model.lora,
+            lora_type=self.cfg.policy.megatron_config.lora_config.lora_type,
+        )
+        self.adapter_store.register_pristine(self.actor_module, self.optimizer, signature)
+
+    def register_adapter(self, model_id: str) -> None:
+        """Register a new LoRA adapter slot. The first call uses the live
+        state as the slot; subsequent calls seed from pristine.
+        """
+        if self.adapter_store is None:
+            raise RuntimeError("AdapterStore not initialised (FFT path)")
+        signature = self.adapter_store.signature
+        if signature is None:
+            raise RuntimeError("register_adapter called before register_pristine_adapter")
+        self.adapter_store.create(model_id, self.actor_module, self.optimizer, signature)
+
+    def delete_adapter(self, model_id: str) -> None:
+        if self.adapter_store is None:
+            raise RuntimeError("AdapterStore not initialised (FFT path)")
+        self.adapter_store.delete(model_id)
+        # Drop the per-tenant safetensors subdir written by
+        # _save_lora_adapters_and_sync. Rank 0 wrote it; rank 0 cleans it.
+        # Other ranks no-op. Best-effort — log on failure but don't propagate.
+        if self._rank == 0:
+            _, lora_sync_path = self._resolve_lora_sync_target(model_id)
+            base_sync_path = self.cfg.policy.model.lora.lora_sync_path
+            if lora_sync_path != base_sync_path:
+                try:
+                    shutil.rmtree(lora_sync_path)
+                except FileNotFoundError:
+                    pass  # already gone, fine
+                except OSError as e:
+                    logger.warning(f"Failed to remove lora_sync subdir {lora_sync_path}: {e}")
+
+    def swap_to_adapter(self, model_id: str) -> None:
+        """Make ``model_id`` the live adapter on this worker. No-op if it
+        already is. Issues local tensor.copy_()s + dp_group barriers.
+        """
+        if self.adapter_store is None:
+            return  # FFT path: no-op
+        self.adapter_store.swap_to(model_id, self.actor_module, self.optimizer)
+
+    def adapter_store_state(self) -> dict:
+        """Diagnostic: return current_id + registered model_ids. Cheap; useful
+        for tests."""
+        if self.adapter_store is None:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "current_id": self.adapter_store.current_id,
+            "registered": self.adapter_store.registered_ids(),
+            "num_adapters": self.adapter_store.num_adapters(),
+        }
 
 
 class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
@@ -841,27 +1173,77 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
         self.model: MegatronModelWrapper = None
         self.actor_module: List[nn.Module] = None
 
-    def offload_to_cpu(self, pin_memory=True, non_blocking=True, **kwargs):
-        self._set_numa_affinity(torch.distributed.get_rank() % torch.cuda.device_count())
-        self.strategy.offload_to_cpu(self.actor_module, None, pin_memory, non_blocking)
+    def forward(self, data: TrainingInputBatch) -> WorkerOutput:
+        """Run inference forward pass.
 
-    def backload_to_gpu(self, non_blocking=True, **kwargs):
-        self.strategy.backload_to_gpu(self.actor_module, None, non_blocking)
+        Returns a :class:`WorkerOutput` whose ``loss_fn_outputs`` carries one
+        per-sample dict with key ``"logprobs"``.
+        """
+        from skyrl.backends.skyrl_train.utils.replay_utils import clear_router_replay
+
+        # Run in micro batches grouped into a single mini-batch
+        micro_bsz = self.cfg.micro_forward_batch_size_per_gpu
+        micro_batches = data.chunk(micro_bsz)
+
+        # Build micro-batch dicts expected by policy.forward_mini_batch
+        micro_dicts = []
+        device = torch.cuda.current_device()
+        for micro in micro_batches:
+            micro.to(device)
+            sequences = micro["sequences"]
+            attention_mask = micro["attention_mask"]
+            num_actions = micro.metadata["response_length"]
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 0)
+            rollout_expert_indices = micro.get("rollout_expert_indices")
+            if rollout_expert_indices is not None:
+                rollout_expert_indices = rollout_expert_indices.to(torch.int32)
+            micro_dicts.append(
+                {
+                    "sequences": sequences,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "num_actions": num_actions,
+                    "rollout_expert_indices": (rollout_expert_indices if self.enable_router_replay else None),
+                }
+            )
+
+        self.model.eval()
+        seq_len = micro_dicts[0]["sequences"].shape[1]
+        mbs = micro_dicts[0]["sequences"].shape[0]
+        with torch.no_grad():
+            log_probs = self.model.forward(
+                micro_batches=micro_dicts,
+                seq_len=seq_len,
+                micro_batch_size=mbs,
+                temperature=self.cfg.algorithm.temperature,
+            )
+
+        log_probs = log_probs.to("cpu")
+        clear_router_replay()
+        loss_fn_outputs = [{"logprobs": log_probs[i].tolist()} for i in range(log_probs.shape[0])]
+        return WorkerOutput(loss_fn_outputs=loss_fn_outputs, metrics={})
 
     def init_worker_process_group(self):
         """
         Override DistributedTorchRayActor.init_worker_process_group to use megatron distributed setup to create the mesh.
         """
         if not torch.distributed.is_initialized():
+            # Ensure CUDA device is set before process group init — required when
+            # using split "cpu:gloo,cuda:nccl" backend to avoid 'invalid device ordinal'
+            # errors during NCCL communicator creation in subgroups.
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            torch.cuda.set_device(local_rank)
             # Default torch dist pg init timeout is 10 minutes (600 seconds)
             torch.distributed.init_process_group(
-                backend="nccl", timeout=timedelta(seconds=SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
+                backend="cpu:gloo,cuda:nccl", timeout=timedelta(seconds=SKYRL_WORKER_NCCL_TIMEOUT_IN_S)
             )
 
         self.strategy = MegatronStrategy(
             megatron_config=self.cfg.ref.megatron_config,
             optimizer_config=None,
             seed=self.cfg.seed,
+            node_local_rank=self._local_rank,
         )
         self.strategy.setup_distributed()
 
@@ -908,10 +1290,6 @@ class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
 
         # create worker model
         self.model = MegatronModelWrapper(config=self.cfg, actor_module=self.actor_module)
-
-    def get_weight_statistics(self):
-        """Compute lightweight statistics for model weights"""
-        raise NotImplementedError()
 
     def _set_pad_token_id(self, pad_token_id):
         # this already gets set in the init_model method

@@ -1,9 +1,9 @@
 set -x
 
 # Colocated GRPO training+generation for Qwen2.5-1.5B-Instruct on GSM8K without sequence packing.
-# uv run examples/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
+# uv run examples/train/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
 # export WANDB_API_KEY=<your_key_here>
-# bash examples/training_backends/run_no_seq_pack.sh
+# bash examples/train/training_backends/run_no_seq_pack.sh
 
 uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   trainer.algorithm.advantage_estimator="grpo" \
@@ -11,14 +11,14 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   data.val_data="['$HOME/data/gsm8k/validation.parquet']" \
   trainer.policy.model.path="Qwen/Qwen2.5-1.5B-Instruct" \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.placement.policy_num_gpus_per_node=4 \
   trainer.placement.ref_num_gpus_per_node=4 \
   generator.inference_engine.num_engines=4 \
   generator.inference_engine.tensor_parallel_size=1 \
   trainer.train_batch_size=16 \
   trainer.max_prompt_length=512 \
-  trainer.use_sample_packing=false \
+  trainer.remove_microbatch_padding=false \
   trainer.micro_train_batch_size_per_gpu=8 \
   trainer.micro_forward_batch_size_per_gpu=32 \
   generator.sampling_params.max_generate_length=1024 \

@@ -147,7 +147,12 @@ class RemoteInferenceEngine(InferenceEngineInterface):
     def ep_size(self) -> int:
         return self._ep_size
 
-    async def generate(self, input_batch: InferenceEngineInput) -> InferenceEngineOutput:
+    async def generate(
+        self,
+        input_batch: InferenceEngineInput,
+        model: Optional[str] = None,
+    ) -> InferenceEngineOutput:
+
         # 1. Prepare inputs
         prompts = input_batch.get("prompts")
         prompt_token_ids: Optional[List[List[int]]] = input_batch.get("prompt_token_ids")
@@ -201,7 +206,11 @@ class RemoteInferenceEngine(InferenceEngineInterface):
             raise ValueError(f"Invalid engine backend: {self.engine_backend}")
 
         return InferenceEngineOutput(
-            responses=outputs, stop_reasons=finish_reasons, response_ids=output_ids, response_logprobs=None
+            responses=outputs,
+            stop_reasons=finish_reasons,
+            response_ids=output_ids,
+            response_logprobs=None,
+            prompt_logprobs=None,
         )
 
     async def chat_completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:

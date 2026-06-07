@@ -15,7 +15,6 @@ from uuid import uuid4
 import ray
 import vllm
 from loguru import logger
-from packaging import version
 from vllm import SamplingParams
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -28,7 +27,12 @@ from vllm.entrypoints.openai.completion.protocol import (
 )
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
-from vllm.entrypoints.openai.models.serving import BaseModelPath, OpenAIServingModels
+from vllm.entrypoints.openai.models.serving import (
+    BaseModelPath,
+    OpenAIModelRegistry,
+    OpenAIServingModels,
+)
+from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
 
@@ -98,8 +102,7 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
 
         setup_envvars_for_vllm(kwargs, bundle_indices)
         vllm_v1_disable_multiproc = kwargs.pop("vllm_v1_disable_multiproc", False)
-        if vllm_v1_disable_multiproc or vllm.__version__ == "0.8.2":
-            # https://github.com/vllm-project/vllm/blob/effc5d24fae10b29996256eb7a88668ff7941aed/examples/offline_inference/reproduciblity.py#L11
+        if vllm_v1_disable_multiproc:
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
         # Store common attributes
@@ -149,6 +152,7 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
         stop_reasons: List[str] = []
         response_ids: List[List[int]] = []
         response_logprobs: Optional[List[List[float]]] = []
+        prompt_logprobs_list: List[Optional[List[float]]] = []
         rollout_expert_indices: Optional[List[List[List[List[int]]]]] = []
 
         for output in outputs:
@@ -171,6 +175,29 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
                     del token_logprobs
             response_logprobs.append(_logprobs)
 
+            # Extract per-prompt-token logprobs (from RequestOutput, not CompletionOutput).
+            # Returns logprob of each prompt token given prior context, skipping position 0
+            # (which has no prior context). This matches the JAX backend which computes
+            # logits_to_logprobs(all_logits[:, :-1, :], input_ids[:, 1:]) → length prompt_len - 1.
+            _prompt_logprobs = None
+            if output.prompt_logprobs is not None:
+                _prompt_logprobs = []
+                for i, pos_logprobs in enumerate(output.prompt_logprobs):
+                    if pos_logprobs is None:
+                        # First position has no prior context; skip it (matching JAX backend).
+                        # Only first position can be None
+                        continue
+                    else:
+                        token_id = output.prompt_token_ids[i]
+                        if token_id not in pos_logprobs:
+                            raise RuntimeError(
+                                f"vLLM prompt_logprobs missing actual token at position {i} "
+                                f"(token_id={token_id}). This violates vLLM's contract that "
+                                f"the actual prompt token is always returned regardless of rank."
+                            )
+                        _prompt_logprobs.append(pos_logprobs[token_id].logprob)
+            prompt_logprobs_list.append(_prompt_logprobs)
+
             _routed_experts = None
             if resp.routed_experts is not None:
                 if hasattr(resp.routed_experts, "tolist"):
@@ -182,6 +209,9 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
         if len(response_logprobs) and response_logprobs[0] is None:
             response_logprobs = None  # hack: assume uniform sampling params
 
+        if len(prompt_logprobs_list) and prompt_logprobs_list[0] is None:
+            prompt_logprobs_list = None  # hack: assume uniform sampling params
+
         if len(rollout_expert_indices) > 0 and rollout_expert_indices[0] is None:
             rollout_expert_indices = None  # hack: assume uniform sampling params
 
@@ -190,6 +220,7 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
             stop_reasons=stop_reasons,
             response_ids=response_ids,
             response_logprobs=response_logprobs,
+            prompt_logprobs=prompt_logprobs_list,
             rollout_expert_indices=rollout_expert_indices,
         )
 
@@ -232,14 +263,14 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
         if kwargs.get("pipeline_parallel_size", 1) > 1:
             raise ValueError(
                 "Pipeline parallelism is only supported with AsyncVLLMInferenceEngine. "
-                "Please set `generator.async_engine=true` in your config."
+                "Please set `generator.inference_engine.async_engine=true` in your config."
             )
         # Pop enable_ray_prometheus_stats - only supported for async engine
         enable_ray_prometheus_stats = kwargs.pop("enable_ray_prometheus_stats", False)
         if enable_ray_prometheus_stats:
             logger.warning(
                 "enable_ray_prometheus_stats is only supported with AsyncVLLMInferenceEngine. "
-                "Set `generator.async_engine=true` to enable Ray Prometheus stats logging."
+                "Set `generator.inference_engine.async_engine=true` to enable Ray Prometheus stats logging."
             )
         return vllm.LLM(*args, **kwargs)
 
@@ -305,10 +336,16 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
             args=(pickled_init_info,),
         )
 
-    async def _load_lora_from_disk(self, lora_path: str):
-        """Load LoRA adapters from disk using vLLM's native add_lora method."""
+    async def _load_lora_from_disk(self, lora_path: str, lora_name: str = ""):
+        """Load LoRA adapters from disk using vLLM's native add_lora method.
+
+        When ``lora_name`` is empty (legacy single-tenant), a numeric name is
+        generated. Multi-tenant callers pass ``lora_name`` so subsequent
+        ``model=<lora_name>`` sampling routes to the right adapter.
+        """
         lora_id = int(time.time_ns() % 0x7FFFFFFF)
-        lora_request = LoRARequest(lora_name=f"{lora_id}", lora_int_id=lora_id, lora_path=lora_path)
+        name = lora_name or f"{lora_id}"
+        lora_request = LoRARequest(lora_name=name, lora_int_id=lora_id, lora_path=lora_path)
         result = self.llm.llm_engine.add_lora(lora_request)
         return result
 
@@ -317,7 +354,7 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
 
         # Handle LoRA disk loading request
         if isinstance(request, LoraLoadRequest):
-            return await self._load_lora_from_disk(request.lora_path)
+            return await self._load_lora_from_disk(request.lora_path, lora_name=request.lora_name)
 
         if not len(request):
             raise ValueError("Weight update request must not be empty")
@@ -351,10 +388,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         enable_log_requests = kwargs.pop("enable_log_requests", False)
         max_log_len = kwargs.pop("max_log_len", None)
 
-        if version.parse(vllm.__version__) >= version.parse("0.10.0"):
-            engine_args = vllm.AsyncEngineArgs(enable_log_requests=enable_log_requests, **kwargs)
-        else:
-            engine_args = vllm.AsyncEngineArgs(disable_log_requests=not enable_log_requests, **kwargs)
+        engine_args = vllm.AsyncEngineArgs(enable_log_requests=enable_log_requests, kv_cache_metrics=True, **kwargs)
 
         # Setup stat loggers for vLLM v1 if Ray Prometheus stats are enabled
         stat_loggers = None
@@ -363,10 +397,8 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
 
         engine = vllm.AsyncLLMEngine.from_engine_args(engine_args, stat_loggers=stat_loggers)
 
-        # Adapted from https://github.com/volcengine/verl/blob/e90f18c40aa639cd25092b78a5ff7e2d2508c088/verl/workers/rollout/vllm_rollout/vllm_async_server.py#L327
-        model_config = engine.model_config
         model_path = kwargs.get("model")
-        # Use served_model_name if provided (from generator.served_model_name config),
+        # Use served_model_name if provided (from generator.inference_engine.served_model_name config),
         # otherwise fall back to model_path. This allows using a different model name
         # in HTTP endpoint requests than the actual model path.
         # See: https://github.com/NovaSky-AI/SkyRL/pull/238#discussion_r2326561295
@@ -374,33 +406,43 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         model_name = served_model_name if served_model_name is not None else model_path
 
         base_model_paths = [BaseModelPath(name=model_name, model_path=model_path)]
-
-        # vllm >= 0.11.2 removed model_config from OpenAI serving APIs
-        is_new_api = version.parse(vllm.__version__) >= version.parse("0.11.2")
-        legacy_kwargs = {}
-        if is_new_api:
-            models = OpenAIServingModels(engine, base_model_paths)
-        else:
-            models = OpenAIServingModels(engine, model_config, base_model_paths)
-            legacy_kwargs["model_config"] = model_config
+        models = OpenAIServingModels(engine, base_model_paths)
 
         # Build request logger for debugging (off by default).
-        # Enable via: generator.engine_init_kwargs.enable_log_requests=true
-        # Optionally limit logged chars: generator.engine_init_kwargs.max_log_len=256
+        # Enable via: generator.inference_engine.engine_init_kwargs.enable_log_requests=true
+        # Optionally limit logged chars: generator.inference_engine.engine_init_kwargs.max_log_len=256
         request_logger = None
         if enable_log_requests:
             from vllm.entrypoints.logger import RequestLogger
 
             request_logger = RequestLogger(max_log_len=max_log_len)
 
+        chat_template = openai_kwargs.pop("chat_template", None)
+
+        from vllm.renderers import renderer_from_config
+
+        model_registry = OpenAIModelRegistry(
+            model_config=engine.model_config,
+            base_model_paths=base_model_paths,
+        )
+        renderer = renderer_from_config(engine.vllm_config)
+        openai_serving_render = OpenAIServingRender(
+            model_config=engine.model_config,
+            renderer=renderer,
+            model_registry=model_registry,
+            request_logger=request_logger,
+            chat_template=chat_template,
+            chat_template_content_format="auto",
+        )
+
         self.openai_serving_chat = OpenAIServingChat(
             engine_client=engine,
             models=models,
             response_role="assistant",
+            openai_serving_render=openai_serving_render,
             request_logger=request_logger,
-            chat_template=openai_kwargs.pop("chat_template", None),  # used to template /chat/completions requests
+            chat_template=chat_template,
             chat_template_content_format="auto",
-            **legacy_kwargs,
             **openai_kwargs,
         )
 
@@ -409,8 +451,8 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         self.openai_serving_completion = OpenAIServingCompletion(
             engine_client=engine,
             models=models,
+            openai_serving_render=openai_serving_render,
             request_logger=request_logger,
-            **legacy_kwargs,
         )
         return engine
 
@@ -438,10 +480,16 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
             )
             return None
 
-    async def _load_lora_from_disk(self, lora_path: str):
-        """Load LoRA adapters from disk using vLLM's native add_lora method."""
+    async def _load_lora_from_disk(self, lora_path: str, lora_name: str = ""):
+        """Load LoRA adapters from disk using vLLM's native add_lora method.
+
+        When ``lora_name`` is empty (legacy single-tenant), a numeric name is
+        generated. Multi-tenant callers pass ``lora_name`` so subsequent
+        ``model=<lora_name>`` sampling routes to the right adapter.
+        """
         lora_id = int(time.time_ns() % 0x7FFFFFFF)
-        lora_request = LoRARequest(lora_name=f"{lora_id}", lora_int_id=lora_id, lora_path=lora_path)
+        name = lora_name or f"{lora_id}"
+        lora_request = LoRARequest(lora_name=name, lora_int_id=lora_id, lora_path=lora_path)
         result = await self.llm.add_lora(lora_request)
         return result
 
@@ -524,7 +572,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
 
         # Check for LoRA disk loading request
         if isinstance(request, LoraLoadRequest):
-            return await self._load_lora_from_disk(request.lora_path)
+            return await self._load_lora_from_disk(request.lora_path, lora_name=request.lora_name)
 
         if not len(request):
             raise ValueError("Weight update request must not be empty")
@@ -562,20 +610,13 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
                 request = CompletionRequest(**body)
             assert request.stream is False, "Streaming is not supported in SkyRL yet, please set stream to False."
         except Exception as e:
-            if version.parse(vllm.__version__) >= version.parse("0.10.0"):
-                return ErrorResponse(
-                    error=ErrorInfo(
-                        message=str(e),
-                        type=HTTPStatus.BAD_REQUEST.phrase,
-                        code=HTTPStatus.BAD_REQUEST.value,
-                    ),
-                ).model_dump()
-            else:
-                return ErrorResponse(
+            return ErrorResponse(
+                error=ErrorInfo(
                     message=str(e),
                     type=HTTPStatus.BAD_REQUEST.phrase,
                     code=HTTPStatus.BAD_REQUEST.value,
-                ).model_dump()
+                ),
+            ).model_dump()
 
         # 2. Call vllm engine
         try:
@@ -607,20 +648,13 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
             else:
                 http_status = HTTPStatus.INTERNAL_SERVER_ERROR
 
-            if version.parse(vllm.__version__) >= version.parse("0.10.0"):
-                return ErrorResponse(
-                    error=ErrorInfo(
-                        message=str(e),
-                        type=http_status.phrase,
-                        code=http_status.value,
-                    ),
-                ).model_dump()
-            else:
-                return ErrorResponse(
+            return ErrorResponse(
+                error=ErrorInfo(
                     message=str(e),
                     type=http_status.phrase,
                     code=http_status.value,
-                ).model_dump()
+                ),
+            ).model_dump()
 
     async def chat_completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
         """OpenAI-compatible HTTP endpoint for handling `/chat/completions` in Python vLLM engine.

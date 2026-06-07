@@ -61,7 +61,7 @@ class InferenceEngineClient(InferenceEngineInterface):
         self.inference_engine_cfg = inference_engine_cfg
         # Use served_model_name if provided, otherwise fall back to model path.
         # served_model_name allows using a different model name for HTTP endpoint validation
-        # than the actual model path. See ppo_base_config.yaml for details.
+        # than the actual model path. See InferenceEngineConfig.served_model_name in skyrl/train/config/config.py.
         served_model_name = inference_engine_cfg.served_model_name
         if served_model_name is not None:
             self.model_name = served_model_name
@@ -71,6 +71,10 @@ class InferenceEngineClient(InferenceEngineInterface):
         self.enable_http_endpoint = inference_engine_cfg.enable_http_endpoint
         self.http_endpoint_host = inference_engine_cfg.http_endpoint_host
         self.http_endpoint_port = inference_engine_cfg.http_endpoint_port
+
+        # we assume that dp_size is same for all engines
+        dp_sizes = [engine.dp_size() for engine in self.engines]
+        assert len(set(dp_sizes)) <= 1, f"Expected all engines to have the same DP size, got {dp_sizes}"
         if self.enable_http_endpoint:
             self._spin_up_http_endpoint()
 
@@ -85,7 +89,12 @@ class InferenceEngineClient(InferenceEngineInterface):
         awaitables = [getattr(engine, method_name)(*args, **kwargs) for engine in self.engines]
         return await asyncio.gather(*awaitables)
 
-    async def generate(self, input_batch: InferenceEngineInput) -> InferenceEngineOutput:
+    async def generate(
+        self,
+        input_batch: InferenceEngineInput,
+        model: Optional[str] = None,
+    ) -> InferenceEngineOutput:
+
         # 0. Extract input
         prompts = input_batch.get("prompts")
         prompt_token_ids = input_batch.get("prompt_token_ids")
@@ -150,11 +159,14 @@ class InferenceEngineClient(InferenceEngineInterface):
                     add_rollout_expert_indices = True
                     rollout_expert_indices[original_idx] = result["rollout_expert_indices"][local_idx]
 
+        # TODO: Should we support prompt_logprobs in the training/rollout generate() path?
+        # Currently only the sample() path supports prompt_logprobs.
         return InferenceEngineOutput(
             responses=responses,
             stop_reasons=stop_reasons,
             response_ids=response_ids,
             response_logprobs=response_logprobs if add_resp_logprobs else None,
+            prompt_logprobs=None,
             rollout_expert_indices=rollout_expert_indices if add_rollout_expert_indices else None,
         )
 
@@ -179,6 +191,7 @@ class InferenceEngineClient(InferenceEngineInterface):
         num_samples: int,
         sampling_params: Dict[str, Any],
         session_id: Optional[Union[str, int]] = None,
+        prompt_logprobs: bool = False,
     ) -> InferenceEngineOutput:
         """Generate multiple independent samples from a single prompt.
 
@@ -192,6 +205,7 @@ class InferenceEngineClient(InferenceEngineInterface):
             session_id: Optional session ID for consistent engine routing (e.g., conversation ID).
                        If None, uses random load-balancing. Tinker API should pass None since
                        each sample() call is independent.
+            prompt_logprobs: If True, return per-token logprobs over the prompt.
 
         Returns:
             InferenceEngineOutput containing num_samples results.
@@ -204,6 +218,7 @@ class InferenceEngineClient(InferenceEngineInterface):
             prompt_token_ids=prompt_token_ids,
             num_samples=num_samples,
             sampling_params=sampling_params,
+            prompt_logprobs=prompt_logprobs,
         )
 
     async def chat_completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -329,7 +344,10 @@ class InferenceEngineClient(InferenceEngineInterface):
         """
         tasks = []
         for i, engine in enumerate(self.engines):
-            engine_init_info = init_info.for_engine(i, engine.tp_size(), engine.pp_size())
+            # With vLLM, DP ranks are managed as separate engine instances
+            # We want the index of truly separate vllm deployments i.e different dist worlds
+            engine_idx = i // engine.dp_size()
+            engine_init_info = init_info.for_engine(engine_idx, engine.tp_size(), engine.pp_size(), engine.dp_size())
             tasks.append(engine.init_weight_update_communicator(engine_init_info))
         await asyncio.gather(*tasks)
 

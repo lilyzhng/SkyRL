@@ -2,8 +2,8 @@ set -x
 
 # Colocated GRPO training+generation for Qwen3-8B on the SWE-Bench task.
 # Uses 1 node with 8 GPUs.
-# uv run --isolated examples/mini_swe_agent/preprocess_swegym.py --output_dir ~/data/swe_gym_subset
-# bash examples/mini_swe_agent/run_mini_swe_8B.sh
+# uv run --isolated examples/train/mini_swe_agent/preprocess_swegym.py --output_dir ~/data/swe_gym_subset
+# bash examples/train/mini_swe_agent/run_mini_swe_8B.sh
 
 DATA_DIR="$HOME/data/swe_gym_subset"
 CKPT_PATH="$HOME/ckpts/llm_mini_swe"
@@ -27,7 +27,7 @@ uv run --isolated --extra fsdp --extra miniswe --env-file examples/train/mini_sw
   trainer.algorithm.advantage_estimator="grpo" \
   trainer.policy.model.path="Qwen/Qwen3-8B" \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.policy_num_nodes=$NNODES \

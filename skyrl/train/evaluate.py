@@ -79,13 +79,15 @@ async def evaluate(
 
     # Extract data_sources from env_extras
     concat_data_sources = [env_extra.get("data_source") for env_extra in concat_env_extras]
-    vis = tokenizer.decode(generator_output["response_ids"][0])
-    log_example(
-        logger,
-        prompt=generator_input["prompts"][0],
-        response=vis,
-        reward=generator_output["rewards"][0],
-    )
+
+    if cfg.trainer.log_example_interval > 0:
+        vis = tokenizer.decode(generator_output["response_ids"][0])
+        log_example(
+            logger,
+            prompt=generator_input["prompts"][0],
+            response=vis,
+            reward=generator_output["rewards"][0],
+        )
 
     # Log eval trajectories as chat-style HTML to WandB (if generator supports it)
     if hasattr(generator, "log_trajectories_to_wandb"):
@@ -191,8 +193,10 @@ async def evaluate_step_wise(
 
     # Extract data_sources from env_extras
     concat_data_sources = [env_extra.get("data_source") for env_extra in concat_env_extras]
-    vis = tokenizer.decode(generator_output["response_ids"][0])
-    logger.info(f"Eval output example: {vis}")
+
+    if cfg.trainer.log_example_interval > 0:
+        vis = tokenizer.decode(generator_output["response_ids"][0])
+        logger.info(f"Eval output example: {vis}")
 
     # Only use the final step metrics
     generator_output_last_step = defaultdict(list)

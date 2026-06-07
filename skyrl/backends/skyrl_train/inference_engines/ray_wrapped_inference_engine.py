@@ -45,11 +45,13 @@ class RayWrappedInferenceEngine(InferenceEngineInterface):
         prompt_token_ids: List[int],
         num_samples: int,
         sampling_params: Dict[str, Any],
+        prompt_logprobs: bool = False,
     ) -> InferenceEngineOutput:
         return await self.inference_engine_actor.sample.remote(
             prompt_token_ids=prompt_token_ids,
             num_samples=num_samples,
             sampling_params=sampling_params,
+            prompt_logprobs=prompt_logprobs,
         )
 
     async def wake_up(self, *args: Any, **kwargs: Any):
@@ -108,10 +110,11 @@ def create_ray_wrapped_inference_engines(
     max_lora_rank=64,
     max_loras=1,
     fully_sharded_loras=False,
+    language_model_only=False,
     engine_init_kwargs: Dict[str, Any] = {},
     rope_scaling: Dict[str, Any] = {},
     rope_theta: float | None = None,
-    enable_ray_prometheus_stats: bool = False,
+    enable_ray_prometheus_stats: bool = True,
     enable_return_routed_experts: bool = False,
     served_model_name: str | None = None,
     distributed_executor_backend: str = "ray",
@@ -142,9 +145,8 @@ def create_ray_wrapped_inference_engines(
             VLLMRayActor,
         )
 
-        # if a dev version is being used, skip the version check
         if "dev" not in vllm.__version__:
-            assert version.parse(vllm.__version__) >= version.parse("0.8.3"), "SkyRL-Train only supports vLLM >= 0.8.3"
+            assert version.parse(vllm.__version__) >= version.parse("0.18.0"), "SkyRL-Train requires vLLM >= 0.18.0"
     else:
         raise ValueError(f"Unsupported backend: {backend}")
 
@@ -233,7 +235,7 @@ def create_ray_wrapped_inference_engines(
             other_kwargs = {}
 
             # served_model_name allows using a different model name for HTTP endpoint validation
-            # than the actual model path. See generator.served_model_name in ppo_base_config.yaml.
+            # than the actual model path. See InferenceEngineConfig.served_model_name in skyrl/train/config/config.py.
             if served_model_name is not None:
                 other_kwargs["served_model_name"] = served_model_name
 
@@ -284,6 +286,7 @@ def create_ray_wrapped_inference_engines(
                 ).remote(
                     model=pretrain,
                     enforce_eager=enforce_eager,
+                    language_model_only=language_model_only,
                     worker_extension_cls="skyrl.backends.skyrl_train.inference_engines.vllm.vllm_engine.WorkerWrap",
                     tensor_parallel_size=tensor_parallel_size,
                     pipeline_parallel_size=pipeline_parallel_size,

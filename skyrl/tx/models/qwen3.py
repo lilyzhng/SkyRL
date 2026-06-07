@@ -81,8 +81,8 @@ class Qwen3Attention(nnx.Module):
         v = v.reshape(B, T, self.num_kv_heads, self.head_dim)
 
         # Apply RoPE
-        q = apply_rope(q, positions, self.head_dim, self.config.rope_theta)
-        k = apply_rope(k, positions, self.head_dim, self.config.rope_theta)
+        q = apply_rope(q, positions, self.head_dim, self.config.rope_parameters["rope_theta"])
+        k = apply_rope(k, positions, self.head_dim, self.config.rope_parameters["rope_theta"])
 
         # Handle KV cache
         if kv_cache is not None:
@@ -172,8 +172,10 @@ class Qwen3Experts(nnx.Module):
     def __call__(
         self, hidden_states: jax.Array, router_logits: jax.Array, adapter_indices: jax.Array | None = None
     ) -> jax.Array:
-        routing_weights, selected_experts = jax.lax.top_k(router_logits, k=self.config.num_experts_per_tok)
-        routing_weights = nnx.softmax(routing_weights, axis=-1)
+        routing_weights = nnx.softmax(router_logits, axis=-1)
+        routing_weights, selected_experts = jax.lax.top_k(routing_weights, k=self.config.num_experts_per_tok)
+        if getattr(self.config, "norm_topk_prob", True):
+            routing_weights = routing_weights / routing_weights.sum(axis=-1, keepdims=True)
 
         num_experts = self.config.num_experts
         num_experts_per_tok = self.config.num_experts_per_tok
@@ -336,6 +338,7 @@ class Qwen3Model(nnx.Module):
         adapter_indices: jax.Array | None = None,
         kv_cache: KVCache | None = None,
         is_training: bool = False,
+        decode_layers=None,
     ) -> ModelOutput:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -353,6 +356,7 @@ class Qwen3Model(nnx.Module):
             output_hidden_states=output_hidden_states,
             gradient_checkpointing=self.config.gradient_checkpointing,
             is_training=is_training,
+            decode_layers=decode_layers,
         )
 
         hidden_states = hidden_states.sum(axis=-2)
@@ -396,6 +400,9 @@ class Qwen3ForCausalLM(nnx.Module, ModelForCausalLM, GeneratorMixin, LogitsProce
         """Return the lm_head callable for logits computation."""
         return self.lm_head or self.model.embed_tokens.T
 
+    def get_decode_layers(self):
+        return self.model.layers.preextract_decode()
+
     def __call__(
         self,
         input_ids: jax.Array,
@@ -406,6 +413,7 @@ class Qwen3ForCausalLM(nnx.Module, ModelForCausalLM, GeneratorMixin, LogitsProce
         adapter_indices: jax.Array | None = None,
         kv_cache: KVCache | None = None,
         is_training: bool = False,
+        decode_layers=None,
     ) -> CausalLMOutput:
         if positions is None:
             positions = jnp.arange(attention_mask.shape[1])[None, :]
@@ -418,6 +426,7 @@ class Qwen3ForCausalLM(nnx.Module, ModelForCausalLM, GeneratorMixin, LogitsProce
             adapter_indices=adapter_indices,
             kv_cache=kv_cache,
             is_training=is_training,
+            decode_layers=decode_layers,
         )
 
         return CausalLMOutput(

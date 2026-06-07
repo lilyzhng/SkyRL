@@ -1,8 +1,8 @@
 set -x
 
 # Colocated DAPO training+generation for Qwen2.5-32B-Instruct on DAPO training data and validate on AIME 2024.
-# bash examples/algorithms/dapo/prepare_dapo_data.sh
-# bash examples/algorithms/dapo/run_dapo_qwen2.5_32b_aime.sh
+# bash examples/train/algorithms/dapo/prepare_dapo_data.sh
+# bash examples/train/algorithms/dapo/run_dapo_qwen2.5_32b_aime.sh
 
 MODEL_NAME="Qwen/Qwen2.5-32B"
 DATA_DIR="$HOME/data/dapo"
@@ -20,7 +20,7 @@ EPS_CLIP_HIGH=0.28
 # dynamic sampling parameters - off by default, since this greatly slows down inference
 DYNAMIC_SAMPLING_TYPE=null
 DYNAMIC_SAMPLING_MAX_SAMPLE_BATCHES=30
-LOSS_REDUCTION="token_mean"
+LOSS_REDUCTION="token_mean_legacy"
 # applies overlong filtering (but not soft overlong punishment)
 APPLY_OVERLONG_FILTERING=true
 # apply soft overlong punishment with custom trainer impl in main_dapo.py
@@ -71,7 +71,7 @@ uv run --isolated --extra fsdp -m examples.train.algorithms.dapo.main_dapo \
   trainer.policy.model.path="$MODEL_NAME" \
   trainer.policy.sequence_parallel_size=$SEQUENCE_PARALLEL_SIZE \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.placement.policy_num_nodes=$NUM_NODES \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS_PER_NODE \
   generator.inference_engine.num_engines=$NUM_INFERENCE_ENGINES \

@@ -1,7 +1,7 @@
 set -x
 
 # GRPO training+generation for Qwen2.5-1.5B-Instruct on GSM8K using a standalone vllm server (at 127.0.0.1:8001)
-# First run `uv run examples/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k` to setup the dataset.
+# First run `uv run examples/train/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k` to setup the dataset.
 # then to launch the server, first run 
 # bash examples/train/remote_inference_engine/run_vllm_server.sh
 # then to start training, run
@@ -29,7 +29,7 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
     trainer.placement.colocate_all=False \
     trainer.placement.policy_num_gpus_per_node="$NUM_TRAINING_GPUS" \
     trainer.placement.ref_num_gpus_per_node="$NUM_TRAINING_GPUS" \
-    trainer.strategy=fsdp2 \
+    trainer.strategy=fsdp \
     trainer.train_batch_size=64 \
     trainer.policy_mini_batch_size=64 \
     trainer.micro_forward_batch_size_per_gpu=20 \

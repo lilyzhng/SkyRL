@@ -6,7 +6,7 @@ import threading
 import time
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncGenerator, ClassVar, Literal
+from typing import Annotated, Any, AsyncGenerator, ClassVar, Literal
 from uuid import uuid4
 
 import fastapi
@@ -14,8 +14,11 @@ import psutil
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import (
+    Base64Bytes,
     BaseModel,
+    Discriminator,
     Field,
+    Tag,
     model_validator,
 )
 from sqlalchemy.exc import IntegrityError
@@ -37,7 +40,10 @@ from skyrl.tinker.db_models import (
     enable_sqlite_wal,
     get_async_database_url,
 )
-from skyrl.tinker.extra import ExternalInferenceClient
+from skyrl.tinker.extra import (
+    ExternalInferenceClient,
+    SkyRLTrainInferenceForwardingClient,
+)
 from skyrl.utils.log import get_uvicorn_log_config, logger
 from skyrl.utils.storage import download_file
 
@@ -108,10 +114,36 @@ async def lifespan(app: FastAPI):
     async with app.state.db_engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
 
-    # Setup external inference client if configured
+    # Setup external inference client if configured.
+    #
+    # Three cases:
+    #   1. external_inference_url set: forward sample requests to a fully
+    #      external vLLM (existing behavior).
+    #   2. backend in (megatron, fsdp) and colocate_all=False: install
+    #      SkyRLTrainInferenceForwardingClient so sample requests go directly
+    #      to the SkyRL-Train-managed vLLM, bypassing the engine's serial loop.
+    #   3. otherwise (JAX, colocated SkyRL-Train, etc.): route everything
+    #      through the engine subprocess.
+    #
+    # The colocated path stays on the engine because vLLM is asleep during
+    # training and only the engine's synchronous sample path knows how to
+    # wake it (save_weights_for_sampler → broadcast → sample).
+    backend_name = app.state.engine_config.backend
+    backend_cfg = app.state.engine_config.backend_config or {}
+    # SkyRL-Train default is colocate_all=True; only opt into forwarding
+    # when the operator explicitly sets it to False.
+    is_colocated = bool(backend_cfg.get("trainer.placement.colocate_all", True))
     if app.state.engine_config.external_inference_url:
         app.state.external_inference_client = ExternalInferenceClient(app.state.engine_config, app.state.db_engine)
         logger.info(f"External engine configured: {app.state.engine_config.external_inference_url}")
+    elif backend_name in ("megatron", "fsdp") and not is_colocated:
+        app.state.external_inference_client = SkyRLTrainInferenceForwardingClient(
+            app.state.engine_config, app.state.db_engine
+        )
+        logger.info(
+            "SkyRL-Train inference forwarding client enabled for non-colocated backend=%s",
+            backend_name,
+        )
     else:
         app.state.external_inference_client = None
         logger.info("Using internal engine for inference")
@@ -155,6 +187,15 @@ async def lifespan(app: FastAPI):
     shutting_down = True
     monitor_task.cancel()
 
+    # Close the forwarding client's persistent httpx connection pool if we
+    # installed one. Cheap no-op when external_inference_client doesn't own
+    # an httpx client (ExternalInferenceClient creates one per call).
+    inference_client = getattr(app.state, "external_inference_client", None)
+    aclose = getattr(inference_client, "aclose", None)
+    if aclose is not None:
+        with suppress(Exception):
+            await aclose()
+
     logger.info(f"Stopping background engine (PID {app.state.background_engine.pid})")
     with suppress(ProcessLookupError):
         background_engine.terminate()
@@ -196,7 +237,7 @@ async def create_future(
     future_db = FutureDB(
         request_type=request_type,
         model_id=model_id,
-        request_data=request_data.model_dump(),
+        request_data=request_data.model_dump(mode="json"),
         status=RequestStatus.PENDING,
     )
     session.add(future_db)
@@ -247,6 +288,7 @@ class CreateModelRequest(BaseModel):
     session_id: str
     base_model: str
     lora_config: LoRAConfig
+    model_role: str = "policy"
 
 
 class CreateModelResponse(BaseModel):
@@ -307,7 +349,61 @@ class EncodedTextChunk(BaseModel):
         return types.EncodedTextChunk(tokens=self.tokens)
 
 
-ModelInputChunk = EncodedTextChunk
+class ImageChunk(BaseModel):
+    type: Literal["image"] = "image"
+    data: Base64Bytes
+    format: Literal["png", "jpeg"]
+    expected_tokens: int | None = None
+
+    def to_types(self) -> types.ImageChunk:
+        return types.ImageChunk.model_construct(
+            data=self.data,
+            format=self.format,
+            expected_tokens=self.expected_tokens,
+        )
+
+
+class ImageAssetPointerChunk(BaseModel):
+    type: Literal["image_asset_pointer"] = "image_asset_pointer"
+    format: Literal["png", "jpeg"]
+    location: str = Field(min_length=1)
+    expected_tokens: int | None = None
+
+    def to_types(self) -> types.ImageAssetPointerChunk:
+        return types.ImageAssetPointerChunk(
+            format=self.format,
+            location=self.location,
+            expected_tokens=self.expected_tokens,
+        )
+
+
+def _get_model_chunk_type(v: Any) -> str:
+    if isinstance(v, dict):
+        if "type" in v:
+            return v["type"]
+        is_encoded_text = "tokens" in v
+        is_image_asset_pointer = "location" in v
+        is_image = "data" in v
+
+        if sum([is_encoded_text, is_image_asset_pointer, is_image]) > 1:
+            raise ValueError(
+                "Ambiguous model chunk type: must be exactly one of 'encoded_text', 'image_asset_pointer', or 'image'"
+            )
+        if is_encoded_text:
+            return "encoded_text"
+        if is_image_asset_pointer:
+            return "image_asset_pointer"
+        if is_image:
+            return "image"
+    return getattr(v, "type", "encoded_text")
+
+
+ModelInputChunk = Annotated[
+    Annotated[EncodedTextChunk, Tag("encoded_text")]
+    | Annotated[ImageAssetPointerChunk, Tag("image_asset_pointer")]
+    | Annotated[ImageChunk, Tag("image")],
+    Discriminator(_get_model_chunk_type),
+]
 
 
 class ModelInput(BaseModel):
@@ -342,6 +438,8 @@ class Datum(BaseModel):
                 weights=weights,
                 advantages=inp["advantages"].to_types() if "advantages" in inp else types.TensorData(data=[]),
                 logprobs=inp["logprobs"].to_types() if "logprobs" in inp else types.TensorData(data=[]),
+                values=inp["values"].to_types() if "values" in inp else types.TensorData(data=[]),
+                returns=inp["returns"].to_types() if "returns" in inp else types.TensorData(data=[]),
             ),
             model_input=self.model_input.to_types(),
         )
@@ -351,12 +449,13 @@ class ForwardBackwardInput(BaseModel):
     _ALLOWED_KEYS_BY_LOSS_FN: ClassVar[dict[str, set[str]]] = {
         "cross_entropy": set(),
         "importance_sampling": set(),
-        "ppo": {"clip_low_threshold", "clip_high_threshold"},
+        "ppo": {"clip_low_threshold", "clip_high_threshold", "value_clip"},
         "cispo": {"clip_low_threshold", "clip_high_threshold"},
+        "ppo_critic": {"value_clip"},
     }
 
     data: list[Datum]
-    loss_fn: Literal["cross_entropy", "importance_sampling", "ppo", "cispo"]
+    loss_fn: Literal["cross_entropy", "importance_sampling", "ppo", "cispo", "ppo_critic"]
     loss_fn_config: dict[str, float] | None = None
 
     @model_validator(mode="after")
@@ -618,6 +717,16 @@ class WeightsInfoResponse(BaseModel):
     lora_rank: int | None = None
 
 
+class ClientConfigResponse(BaseModel):
+    pjwt_auth_enabled: bool = False
+
+
+@app.post("/api/v1/client/config", response_model=ClientConfigResponse)
+async def client_config():
+    """Stub for tinker SDK client_config handshake."""
+    return ClientConfigResponse()
+
+
 @app.get("/api/v1/healthz", response_model=HealthResponse)
 async def healthz():
     """Checks if the API server is ready."""
@@ -692,7 +801,7 @@ async def create_model(request: CreateModelRequest, session: AsyncSession = Depe
         session=session,
         request_type=types.RequestType.CREATE_MODEL,
         model_id=model_id,
-        request_data=types.CreateModelInput(lora_config=lora_config),
+        request_data=types.CreateModelInput(lora_config=lora_config, model_role=request.model_role),
     )
 
     model_db = ModelDB(
@@ -943,6 +1052,12 @@ async def get_sampling_model(request: SampleRequest, session: AsyncSession) -> (
 @app.post("/api/v1/asample", response_model=FutureResponse)
 async def asample(request: SampleRequest, req: Request, session: AsyncSession = Depends(get_session)):
     """Generates samples from the model (async version)."""
+    if request.sampling_session_id is not None and ":" in request.sampling_session_id:
+        raise HTTPException(
+            status_code=400,
+            detail="sampling_session_id must not contain ':' (the routing-key delimiter)",
+        )
+
     base_model, model_path = await get_sampling_model(request, session)
 
     if base_model:
@@ -978,6 +1093,8 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
             num_samples=request.num_samples,
             checkpoint_id=checkpoint_id,
             prompt_logprobs=request.prompt_logprobs if request.prompt_logprobs is not None else False,
+            seq_id=request.seq_id,
+            sampling_session_id=request.sampling_session_id,
         ),
     )
 

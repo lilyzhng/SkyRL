@@ -2,9 +2,9 @@ set -x
 
 # Colocated GRPO training+generation for Qwen3-0.6B on GSM8K with FSDP.
 
-# uv run examples/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
+# uv run examples/train/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
 # export WANDB_API_KEY=<your_key_here>
-# bash examples/megatron/run_fsdp_baseline.sh
+# bash examples/train/megatron/run_fsdp_baseline.sh
 
 DATA_DIR="$HOME/data/gsm8k"
 NUM_GPUS=4
@@ -47,7 +47,7 @@ uv run --isolated --extra megatron -m skyrl.train.entrypoints.main_base \
   generator.inference_engine.gpu_memory_utilization=0.8 \
   trainer.logger="$LOGGER" \
   trainer.project_name="gsm8k_megatron" \
-  trainer.run_name="gsm8k_fsdp1_4gpus" \
+  trainer.run_name="gsm8k_fsdp_4gpus" \
   trainer.resume_mode=null \
   trainer.ckpt_path="$HOME/ckpts/gsm8k_fsdp_ckpt" \
   $@

@@ -4,7 +4,7 @@ set -x
 # Uses 1 node with 8 GPUs.
 # hf download NovaSky-AI/SkyRL-SQL-653-data-newfmt --local-dir $HOME/data/sql --repo-type dataset
 # export WANDB_API_KEY=<your_key_here>
-# bash examples/text_to_sql/run_skyrl_sql.sh
+# bash examples/train/text_to_sql/run_skyrl_sql.sh
 
 # change these paths to your own
 DATA_DIR="$HOME/data/sql"
@@ -25,7 +25,7 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   trainer.policy.model.path="Qwen/Qwen2.5-Coder-7B-Instruct" \
   trainer.epochs=30 \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.policy.fsdp_config.cpu_offload=false \
   trainer.ref.fsdp_config.cpu_offload=true \
   trainer.policy.optimizer_config.max_grad_norm=0.5 \

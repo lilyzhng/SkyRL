@@ -1,9 +1,9 @@
 set -x
 
 # Colocated SAPO training+generation for Qwen3-4B-Base on DAPO training data and validate on AIME 2024.
-# Uses examples/algorithms/dapo/main_dapo.py script, but with the SAPO policy loss and sequence mean loss reduction.
-# bash examples/algorithms/dapo/prepare_dapo_data.sh
-# bash examples/algorithms/sapo/run_sapo_qwen3_4b_aime.sh
+# Uses examples/train/algorithms/dapo/main_dapo.py script, but with the SAPO policy loss and sequence mean loss reduction.
+# bash examples/train/algorithms/dapo/prepare_dapo_data.sh
+# bash examples/train/algorithms/sapo/run_sapo_qwen3_4b_aime.sh
 
 MODEL_NAME="Qwen/Qwen3-4B-Base"
 DATA_DIR="$HOME/data/dapo"
@@ -61,7 +61,7 @@ uv run --isolated --extra fsdp -m examples.train.algorithms.dapo.main_dapo \
   trainer.algorithm.clip_ratio_c=$CLIP_RATIO_C \
   trainer.policy.model.path="$MODEL_NAME" \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.placement.policy_num_nodes=$NUM_NODES \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS_PER_NODE \
   trainer.policy.fsdp_config.fsdp_size=$NUM_GPUS_PER_NODE \

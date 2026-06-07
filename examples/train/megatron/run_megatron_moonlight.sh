@@ -3,9 +3,9 @@ set -x
 # Colocated GRPO training+generation for Moonlight-16B-A3B-Instruct on GSM8K with Megatron.
 # Runs on 2 nodes of 8xH100s
 
-# uv run examples/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
+# uv run examples/train/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
 # export WANDB_API_KEY=<your_key_here>
-# bash examples/megatron/run_megatron_moonlight.sh
+# bash examples/train/megatron/run_megatron_moonlight.sh
 
 # running moonlight16b
 # hf download moonshotai/Moonlight-16B-A3B-Instruct --local-dir ~/moonlight16b
@@ -57,7 +57,7 @@ uv run --isolated --extra megatron --with blobfile -m skyrl.train.entrypoints.ma
   trainer.ref.megatron_config.expert_tensor_parallel_size=$MEGATRON_ETP \
   trainer.policy.megatron_config.transformer_config_kwargs.num_layers_in_last_pipeline_stage=13 \
   trainer.ref.megatron_config.transformer_config_kwargs.num_layers_in_last_pipeline_stage=13 \
-  trainer.use_sample_packing=true \
+  trainer.remove_microbatch_padding=true \
   trainer.flash_attn=$FLASH_ATTN \
   trainer.epochs=20 \
   trainer.eval_batch_size=1024 \

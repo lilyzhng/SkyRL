@@ -4,9 +4,9 @@ set -x
 
 # Colocated GRPO LoRA training + generation for Qwen2.5-0.5B-Instruct on GSM8K.
 
-# uv run examples/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
+# uv run examples/train/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
 # export WANDB_API_KEY=<your_key_here>
-# bash examples/lora/run_qwen2_5_0.5b_gsm8k_grpo_lora.sh
+# bash examples/train/lora/run_qwen2_5_0.5b_gsm8k_grpo_lora.sh
 
 # NOTE (sumanthrh): `micro_train_batch_size_per_gpu` and `micro_forward_batch_size_per_gpu` can be tuned
 
@@ -25,7 +25,7 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   trainer.placement.colocate_all=true \
   trainer.policy.model.lora.rank=32 \
   trainer.policy.model.lora.alpha=32 \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
   generator.inference_engine.num_engines=$NUM_GPUS \

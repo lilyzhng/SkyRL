@@ -2,7 +2,7 @@ set -x
 
 # Colocated GRPO training+generation for Qwen2.5-32B-Instruct on GSM8K.
 # export WANDB_API_KEY=<your_key_here>
-# bash examples/gsm8k/run_32b_gsm8k.sh
+# bash examples/train/gsm8k/run_32b_gsm8k.sh
 
 
 DATA_DIR="$HOME/data/gsm8k"
@@ -14,7 +14,7 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   trainer.algorithm.advantage_estimator="grpo" \
   trainer.policy.model.path="Qwen/Qwen2.5-32B-Instruct" \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.placement.policy_num_gpus_per_node=8 \
   trainer.placement.ref_num_gpus_per_node=8 \
   trainer.placement.ref_num_nodes=2 \

@@ -3,8 +3,8 @@ set -x
 # Colocated DAPO training+generation for Qwen3-30B-A3B-Base on DAPO with Megatron.
 # Should run on 2 node of 8xH100s
 
-# bash examples/algorithms/dapo/prepare_dapo_data.sh
-# bash examples/algorithms/dapo/run_dapo_qwen3_30b_a3b_megatron_aime.sh
+# bash examples/train/algorithms/dapo/prepare_dapo_data.sh
+# bash examples/train/algorithms/dapo/run_dapo_qwen3_30b_a3b_megatron_aime.sh
 
 MODEL_NAME="Qwen/Qwen3-30B-A3B-Base"
 DATA_DIR="$HOME/data/dapo"
@@ -18,8 +18,7 @@ LOGGER="wandb"  # change to "console" to print to stdout
 
 CLIP_RATIO_LOW=0.2
 CLIP_RATIO_HIGH=0.28
-# use token mean loss reduction
-LOSS_REDUCTION="token_mean"
+LOSS_REDUCTION="token_mean_legacy"
 # applies overlong filtering (but not soft overlong punishment)
 APPLY_OVERLONG_FILTERING=true
 # apply soft overlong punishment with custom trainer impl in main_dapo.py

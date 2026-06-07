@@ -1,5 +1,6 @@
 """Defines interfaces for training data."""
 
+import copy
 import io
 import pickle
 from typing import Any, Dict, Generic, List, Optional, TypedDict, TypeVar
@@ -9,6 +10,103 @@ import torch
 from jaxtyping import Float, Integer
 
 DictType = TypeVar("DictType")
+
+
+def _serialize_tensor(value: torch.Tensor) -> dict:
+    """Serialize a single tensor for pickle protocol."""
+    try:
+        # Fast path: direct memory copy via numpy (works for most dtypes)
+        arr = value.numpy()
+        return {
+            "format": "numpy",
+            "data": arr.tobytes(),
+            "shape": arr.shape,
+            "dtype": str(arr.dtype),
+        }
+    except TypeError:
+        # Fallback for dtypes not supported by numpy (e.g., bfloat16)
+        buffer = io.BytesIO()
+        torch.save(value, buffer)
+        return {
+            "format": "torch",
+            "data": buffer.getvalue(),
+        }
+
+
+def _deserialize_tensor(value: dict) -> torch.Tensor:
+    """Deserialize a single tensor from pickle format."""
+    if value.get("format") == "torch":
+        # Fallback path: torch.load for unsupported dtypes
+        buffer = io.BytesIO(value["data"])
+        return torch.load(buffer, weights_only=True)
+    else:
+        # Fast path: reconstruct from numpy bytes
+        # Also handles legacy format without "format" key
+        arr = np.frombuffer(value["data"], dtype=np.dtype(value["dtype"]))
+        arr = arr.reshape(value["shape"])
+        return torch.from_numpy(arr.copy())
+
+
+class TensorList:
+    """A list of tensors with variable shapes, indexed by batch position.
+
+    Each element can have a different shape (e.g., pixel_values[i] has shape
+    [num_patches_i, dim]). Supports the same batch operations as tensors:
+    slicing, chunking, concatenation, device transfer, and serialization.
+    """
+
+    def __init__(self, tensors: list[torch.Tensor]):
+        if len(tensors) == 0:
+            raise ValueError("Cannot create a TensorList with no tensors.")
+        self.tensors = tensors
+        expected_device = tensors[0].device
+        for tensor in tensors:
+            if tensor.device != expected_device:
+                raise ValueError(
+                    f"All tensors must be on the same device. Expected {expected_device}, got {tensor.device}"
+                )
+
+    def __len__(self) -> int:
+        return len(self.tensors)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return TensorList(self.tensors[index])
+        return self.tensors[index]
+
+    def to(self, device=None, dtype=None, non_blocking=False):
+        return TensorList([t.to(device=device, dtype=dtype, non_blocking=non_blocking) for t in self.tensors])
+
+    def contiguous(self):
+        return TensorList([t.contiguous() for t in self.tensors])
+
+    @property
+    def device(self):
+        return self.tensors[0].device if self.tensors else None
+
+    def repeat(self, repeats: int):
+        return TensorList(self.tensors * repeats)
+
+    def repeat_interleave(self, repeats: int):
+        return TensorList([t for t in self.tensors for _ in range(repeats)])
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, TensorList):
+            return False
+        if len(self) != len(other):
+            return False
+        return all(torch.equal(a, b) for a, b in zip(self.tensors, other.tensors))
+
+    @staticmethod
+    def cat(lists: list["TensorList"]) -> "TensorList":
+        return TensorList([t for tl in lists for t in tl.tensors])
+
+
+def _rebuild_tensor_batch(cls, state: Dict[str, Any]):
+    """Module-level helper for unpickling TensorBatch (must be importable by name)."""
+    obj = dict.__new__(cls)
+    obj.__setstate__(state)
+    return obj
 
 
 # NOTE (sumanthrh): This is inspired by `TensorDict` but is much simpler.
@@ -63,9 +161,9 @@ class TensorBatch(dict, Generic[DictType]):
             value = self[key]
             if value is None:
                 continue
+            if not isinstance(value, (torch.Tensor, TensorList)):
+                raise ValueError(f"Field {key} must be a tensor or TensorList, got {type(value)}")
             self._device = value.device if self._device is None else self._device
-            if not isinstance(value, torch.Tensor):
-                raise ValueError(f"Field {key} must be a tensor, got {type(value)}")
             if len(value) != batch_size:
                 raise ValueError(f"Batch size mismatch in {key}")
             if value.device != self._device:
@@ -79,18 +177,16 @@ class TensorBatch(dict, Generic[DictType]):
         else:
             return super().__getitem__(index)
 
-    def __setitem__(self, key: str, value: Optional[torch.Tensor]) -> None:
+    def __setitem__(self, key: str, value: Optional[torch.Tensor | TensorList]) -> None:
         if value is None:
             super().__setitem__(key, value)
             return
 
-        if not isinstance(value, torch.Tensor):
-            raise ValueError(f"Field {key} must be a tensor, got {type(value)}")
+        if not isinstance(value, (torch.Tensor, TensorList)):
+            raise ValueError(f"Field {key} must be a tensor or TensorList, got {type(value)}")
 
         if hasattr(self, "_batch_size") and self._batch_size is not None and len(value) != self._batch_size:
-            raise ValueError(
-                f"Batch size mismatch in {key}. Expected tensor to be of size {self._batch_size}, got {len(value)}."
-            )
+            raise ValueError(f"Batch size mismatch in {key}. Expected size {self._batch_size}, got {len(value)}.")
 
         super().__setitem__(key, value)
 
@@ -110,8 +206,10 @@ class TensorBatch(dict, Generic[DictType]):
         for key, value in self.items():
             if value is None:
                 continue
-            assert isinstance(value, torch.Tensor), f"Field {key} must be a tensor, got {type(value)}"
-            self[key] = value.to(device, dtype, non_blocking=non_blocking)
+            assert isinstance(
+                value, (torch.Tensor, TensorList)
+            ), f"Field {key} must be a tensor or TensorList, got {type(value)}"
+            self[key] = value.to(device=device, dtype=dtype, non_blocking=non_blocking)
         return self
 
     def contiguous(self) -> "TensorBatch":
@@ -119,8 +217,9 @@ class TensorBatch(dict, Generic[DictType]):
         for key, value in self.items():
             if value is None:
                 continue
-            # some of these asserts are not needed, but it's kept for type safety
-            assert isinstance(value, torch.Tensor), f"Field {key} must be a tensor, got {type(value)}"
+            assert isinstance(
+                value, (torch.Tensor, TensorList)
+            ), f"Field {key} must be a tensor or TensorList, got {type(value)}"
             self[key] = value.contiguous()
         return self
 
@@ -133,6 +232,17 @@ class TensorBatch(dict, Generic[DictType]):
     def device(self) -> torch.device:
         """Get the device for the tensors"""
         return self._device
+
+    def __reduce__(self):
+        """Override pickle reduce to avoid separately pickling raw dict items.
+
+        The default dict-subclass pickle calls iter(self.items()) which pickles
+        each tensor through torch's storage-level pickle. That path fails for
+        dtypes backed by UntypedStorage (e.g. uint16). By returning only
+        (__getstate__,) we force all tensor serialization through our custom
+        numpy/torch.save paths which handle every dtype.
+        """
+        return (_rebuild_tensor_batch, (type(self), self.__getstate__()))
 
     def __getstate__(self):
         """Serialize the `TensorBatch` object for pickle protocol.
@@ -147,24 +257,13 @@ class TensorBatch(dict, Generic[DictType]):
         for key, value in self.items():
             if value is None:
                 batch_dict[key] = None
+            elif isinstance(value, TensorList):
+                batch_dict[key] = {
+                    "format": "tensor_list",
+                    "items": [_serialize_tensor(t) for t in value.tensors],
+                }
             else:
-                try:
-                    # Fast path: direct memory copy via numpy (works for most dtypes)
-                    arr = value.numpy()
-                    batch_dict[key] = {
-                        "format": "numpy",
-                        "data": arr.tobytes(),
-                        "shape": arr.shape,
-                        "dtype": str(arr.dtype),
-                    }
-                except TypeError:
-                    # Fallback for dtypes not supported by numpy (e.g., bfloat16)
-                    buffer = io.BytesIO()
-                    torch.save(value, buffer)
-                    batch_dict[key] = {
-                        "format": "torch",
-                        "data": buffer.getvalue(),
-                    }
+                batch_dict[key] = _serialize_tensor(value)
 
         return {
             "batch_dict": batch_dict,
@@ -181,17 +280,10 @@ class TensorBatch(dict, Generic[DictType]):
         for key, value in state["batch_dict"].items():
             if value is None:
                 self[key] = None
-            elif value.get("format") == "torch":
-                # Fallback path: torch.load for unsupported dtypes
-                buffer = io.BytesIO(value["data"])
-                self[key] = torch.load(buffer, weights_only=True)
+            elif value.get("format") == "tensor_list":
+                self[key] = TensorList([_deserialize_tensor(item) for item in value["items"]])
             else:
-                # Fast path: reconstruct from numpy bytes
-                # Also handles legacy format without "format" key
-                arr = np.frombuffer(value["data"], dtype=np.dtype(value["dtype"]))
-                arr = arr.reshape(value["shape"])
-                # Convert to tensor (makes a copy, which is needed since frombuffer is read-only)
-                self[key] = torch.from_numpy(arr.copy())
+                self[key] = _deserialize_tensor(value)
 
         self._batch_size = state["batch_size"]
         self._device = state["device"]
@@ -214,6 +306,8 @@ class TensorBatch(dict, Generic[DictType]):
         for key, value in self.items():
             if value is None:
                 new_batch[key] = value
+            elif isinstance(value, TensorList):
+                new_batch[key] = value.repeat(repeats)
             else:
                 assert isinstance(value, torch.Tensor), f"Field {key} must be a tensor, got {type(value)}"
                 new_batch[key] = value.repeat(repeats)
@@ -236,6 +330,8 @@ class TensorBatch(dict, Generic[DictType]):
         for key, value in self.items():
             if value is None:
                 new_batch[key] = value
+            elif isinstance(value, TensorList):
+                new_batch[key] = value.repeat_interleave(repeats)
             else:
                 assert isinstance(value, torch.Tensor), f"Field {key} must be a tensor, got {type(value)}"
                 new_batch[key] = value.repeat_interleave(repeats)
@@ -250,7 +346,7 @@ class TensorBatch(dict, Generic[DictType]):
             chunk_data = {}
             for key, value in self.items():
                 if value is not None:
-                    if isinstance(value, torch.Tensor):
+                    if isinstance(value, (torch.Tensor, TensorList)):
                         chunk_data[key] = value[i : i + chunk_size]
                     else:
                         raise ValueError(f"Unsupported type {type(value)} for key {key}")
@@ -277,7 +373,7 @@ class TensorBatch(dict, Generic[DictType]):
         sliced_data = {}
         for key, value in self.items():
             if value is not None:
-                if isinstance(value, torch.Tensor):
+                if isinstance(value, (torch.Tensor, TensorList)):
                     sliced_data[key] = value[slice_obj]
                 else:
                     raise ValueError(f"Unsupported type {type(value)} for key {key}")
@@ -312,7 +408,9 @@ class TensorBatch(dict, Generic[DictType]):
         assert len(shards) > 0, "Cannot cat an empty list of shards"
         for key, value in shards[0].items():
             if value is not None:
-                if isinstance(value, torch.Tensor):
+                if isinstance(value, TensorList):
+                    cat_data[key] = TensorList.cat([shard[key] for shard in shards])
+                elif isinstance(value, torch.Tensor):
                     cat_data[key] = torch.cat([shard[key] for shard in shards])
                 else:
                     raise ValueError(f"Unsupported type {type(value)} for key {key}")
@@ -337,12 +435,13 @@ class TensorBatch(dict, Generic[DictType]):
             return False
         if self.metadata != other.metadata:
             return False
-        if len(self) != len(other):
-            return False
-        if len(self.items()) != len(other.items()):
+        if set(self.keys()) != set(other.keys()):
             return False
         for k, v in self.items():
-            if k not in other or not torch.equal(v, other[k]):
+            if isinstance(v, torch.Tensor) and isinstance(other[k], torch.Tensor):
+                if not torch.equal(v, other[k]):
+                    return False
+            elif v != other[k]:
                 return False
         return True
 
@@ -371,6 +470,8 @@ class TrainingInput(TypedDict, total=False):
     rewards: Optional[Float[torch.Tensor, "batch_size seq_len"]]
     rollout_logprobs: Optional[Float[torch.Tensor, "batch_size seq_len"]]
     rollout_expert_indices: Optional[Integer[torch.Tensor, "batch_size seq_len layer_num topk"]]
+    pixel_values: Optional[TensorList]  # list of `batch_size` [num_patches_i, dim] tensors
+    image_grid_thw: Optional[TensorList]  # list of `batch_size` [num_images_i, 3] tensors
 
 
 class TrainingInputBatch(TensorBatch[TrainingInput]):
@@ -383,3 +484,60 @@ class TrainingOutputBatch(TensorBatch[Dict[str, torch.Tensor]]):
     """Training output data"""
 
     pass
+
+
+def pad_training_input_batch(unpadded_batch: TrainingInputBatch, pad_size: int) -> TrainingInputBatch:
+    """Pad `pad_size` entries to `unpadded_batch`, return a newly allocated TrainingInputBatch. If pad_size is 0, return the original batch."""
+    # TODO(Charlie): This incurs 2x CPU memory usage when pad_size > 0. Optimize when needed.
+    # Padding allocates and concatenates; it should not happen on GPU hot path.
+    assert unpadded_batch.device is None or unpadded_batch.device == torch.device(
+        "cpu"
+    ), f"pad_batch expects batch on CPU, got device={unpadded_batch.device}"
+    assert pad_size >= 0, f"pad_size must be >= 0, got {pad_size}"
+
+    # Handle the special case of no padding.
+    if pad_size == 0:
+        if unpadded_batch.metadata is None:
+            unpadded_batch.metadata = {}
+        unpadded_batch.metadata["pad_size"] = 0
+        return unpadded_batch
+
+    # Pad each tensor depending on its type.
+    new_tensors = {}
+    for key, tensor in unpadded_batch.items():
+        if tensor is None:
+            new_tensors[key] = None
+            continue
+
+        if isinstance(tensor, TensorList):
+            assert len(tensor) > 0, f"Cannot pad empty TensorList field {key!r}"
+            padding = TensorList([tensor[0].clone() for _ in range(pad_size)])
+            new_tensors[key] = TensorList.cat([tensor, padding])
+        elif key == "loss_mask":
+            # Ensures that padding tensors don't count towards the loss
+            additional_dims = tensor.shape[1:]
+            padding_tensor = torch.zeros(pad_size, *additional_dims, dtype=tensor.dtype, device=tensor.device)
+            new_tensors[key] = torch.cat([tensor, padding_tensor], dim=0)
+        else:
+            # Copy row 0 `pad_size` times. Loss masked so values don't affect the loss. Just need valid shape/dtype.
+            assert tensor.shape[0] > 0, f"Cannot pad empty tensor field {key!r}"
+            pad_indices = [0] * pad_size
+            padding_tensor = tensor[pad_indices].clone()
+            new_tensors[key] = torch.cat([tensor, padding_tensor], dim=0)
+
+    # Update metadata as well.
+    new_metadata = {}
+    old_metadata = unpadded_batch.metadata or {}
+    for key, value in old_metadata.items():
+        if key == "uids":
+            new_metadata["uids"] = value + [f"pad{i}" for i in range(pad_size)]
+        elif key == "is_last_step":
+            new_metadata["is_last_step"] = value + [True for _ in range(pad_size)]
+        else:
+            new_metadata[key] = copy.deepcopy(value)
+    new_metadata["pad_size"] = pad_size
+
+    new_batch = TrainingInputBatch(new_tensors)
+    new_batch.metadata = new_metadata
+
+    return new_batch

@@ -3,9 +3,9 @@ set -x
 # Colocated GRPO training+generation for Qwen3-30B-A3B on GSM8K with Megatron.
 # Runs on 2 nodes of 8xH100s
 
-# uv run examples/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
+# uv run examples/train/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
 # export WANDB_API_KEY=<your_key_here>
-# bash examples/megatron/run_megatron_qwen3-30b-a3b.sh
+# bash examples/train/megatron/run_megatron_qwen3-30b-a3b.sh
 
 DATA_DIR="$HOME/data/gsm8k"
 LOGGER="wandb"  # change to "console" to print to stdout
@@ -57,7 +57,7 @@ uv run --isolated --extra megatron -m skyrl.train.entrypoints.main_base \
   trainer.policy.megatron_config.transformer_config_kwargs.recompute_granularity=$RECOMPUTE_GRANULARITY \
   trainer.policy.megatron_config.transformer_config_kwargs.recompute_method=$RECOMPUTE_METHOD \
   trainer.policy.megatron_config.transformer_config_kwargs.recompute_num_layers=$RECOMPUTE_NUM_LAYERS \
-  trainer.use_sample_packing=true \
+  trainer.remove_microbatch_padding=true \
   trainer.flash_attn=$FLASH_ATTN \
   trainer.epochs=20 \
   trainer.eval_batch_size=1024 \

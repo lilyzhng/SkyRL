@@ -7,7 +7,7 @@ import sys
 import ray
 import torch
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 
 from skyrl.train.config import AlgorithmConfig, make_config
 from skyrl.train.trainer import RayPPOTrainer
@@ -36,11 +36,13 @@ class DAPOTrainer(RayPPOTrainer):
     """
 
     @torch.no_grad()
-    def postprocess_generator_output(self, generator_output: GeneratorOutput, uids: List[str]) -> GeneratorOutput:
+    def postprocess_generator_output(
+        self, generator_output: GeneratorOutput, uids: List[str]
+    ) -> Tuple[GeneratorOutput, List[str]]:
         # NOTE (sumanthrh): Given the usage of `make_config`, the algorithm config subclass for DAPO is
         # created dynamically and thus IDEs will not be able to resolve the attributes
         # For better typing, you can always define a custom subclass of DAPOConfig manually.
-        # See examples/terminal_bench for an example.
+        # See examples/train_integrations/harbor for an example.
         overlong_buffer_len = self.cfg.trainer.algorithm.overlong_buffer_len
         overlong_buffer_penalty_factor = self.cfg.trainer.algorithm.overlong_buffer_penalty_factor
         # modify rewards here

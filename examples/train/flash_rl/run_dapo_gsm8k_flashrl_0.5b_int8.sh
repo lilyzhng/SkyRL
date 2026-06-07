@@ -3,9 +3,9 @@ set -x
 # Colocated DAPO training+generation for Qwen2.5-0.5B-Instruct on GSM8K with Int8 rollouts.
 # The configuration is tested on 4 H100 GPUs.
 
-# uv run --isolated examples/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
+# uv run --isolated examples/train/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
 # export WANDB_API_KEY=<your_key_here>
-# bash examples/flash_rl/run_dapo_gsm8k_flashrl_0.5b_int8.sh
+# bash examples/train/flash_rl/run_dapo_gsm8k_flashrl_0.5b_int8.sh
 
 DATA_DIR="$HOME/data/gsm8k"
 NUM_GPUS=4
@@ -60,7 +60,7 @@ uv run --isolated --extra flashrl --env-file examples/train/flash_rl/.env.int8 -
   trainer.algorithm.off_policy_correction.token_tis_ratio_clip_high=$TIS_IMP_RATIO_CAP \
   trainer.policy.model.path="Qwen/Qwen2.5-0.5B-Instruct" \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
   generator.inference_engine.num_engines=$NUM_GPUS \

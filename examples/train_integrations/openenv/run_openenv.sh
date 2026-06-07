@@ -10,7 +10,7 @@ set -x
 # uv run envs/openenv/install_environment.py
 
 # export WANDB_API_KEY=<your_key_here>
-# bash examples/openenv/run_dummy_openenv.sh
+# bash examples/train_integrations/openenv/run_openenv.sh
 
 # You can override the default values with e.g.: `NUM_GPUS=1 bash examples/train_integrations/openenv/run_dummy_openenv.sh`.
 
@@ -29,7 +29,7 @@ uv run --isolated --extra fsdp --with "openenv-core@git+https://github.com/meta-
   trainer.algorithm.advantage_estimator="grpo" \
   trainer.policy.model.path="Qwen/Qwen2.5-1.5B-Instruct" \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=fsdp \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.critic_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
